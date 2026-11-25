@@ -216,3 +216,158 @@ def test_compression_and_zip_exports():
     import io, zipfile
     assert zipfile.ZipFile(io.BytesIO(P.pages_as_images(plain, 50))).namelist() == ["page-01.png", "page-02.png"]
     assert zipfile.ZipFile(io.BytesIO(P.pages_as_pdfs(plain))).namelist() == ["page-01.pdf", "page-02.pdf"]
+
+
+# -- Editor ----------------------------------------------------------------
+
+def _typed_pdf(lines=("Invoice number 2291", "Payable by 14 December 2026", "Total due: Rs 48,500")) -> bytes:
+    doc = fitz.open()
+    page = doc.new_page()
+    for i, text in enumerate(lines):
+        page.insert_text((60, 80 + i * 14.5), text, fontsize=14, fontname="tiro")  # tight leading on purpose
+    page.draw_rect(fitz.Rect(50, 60, 400, 130), color=(0, 0, 0))
+    return doc.tobytes()
+
+
+def _ink(pdf: bytes, box, page_no=0, rotation=0) -> int:
+    """How many dark pixels a region of the rendered page holds."""
+    image = P.render_page(pdf, page_no, 72, rotation).convert("L").crop(tuple(int(v) for v in box))
+    return sum(1 for v in image.getdata() if v < 140)
+
+
+def test_clicking_a_line_edits_only_that_line():
+    pdf = _typed_pdf()
+    line = P.text_line_at(pdf, 0, 100, 90)
+    assert line["text"] == "Payable by 14 December 2026"
+    assert (line["font"], line["erase"], line["size"]) == ("serif", "text", 14.0)
+    assert P.text_line_at(pdf, 0, 500, 700) is None
+    edit = {"kind": "replace", "rotation": 0, **line, "text": "Payable by 2 January 2027", "changed": True}
+    out, _ = P.build_pdf(pdf, edits={0: [edit]})
+    with fitz.open(stream=out) as doc:
+        text = doc[0].get_text()
+        assert "2 January 2027" in text and "14 December" not in text
+        # the lines above and below overlap this one's box and must survive whole, as must the frame
+        assert "Invoice number 2291" in text and "Total due: Rs 48,500" in text
+        assert doc[0].get_drawings()
+    untouched, _ = P.build_pdf(pdf, edits={0: [{**edit, "changed": False}]})
+    with fitz.open(stream=untouched) as doc:
+        assert "14 December" in doc[0].get_text()
+
+
+@needs_ocr
+def test_clicking_a_scanned_line_gives_its_wording_and_look(results):
+    target = next(ln for ln in results[0]["lines"] if "SHS/2026/114" in ln["text"])
+    x, y = (target["x0"] + target["x1"]) / 2, (target["y0"] + target["y1"]) / 2
+    line = P.text_line_at(SAMPLE, 0, x, y, 0, results[0])
+    assert "SHS/2026/114" in line["text"] and line["erase"] == "pixels"
+    assert 9 <= line["size"] <= 15  # typeset at 13pt; not inflated by the gap before "Date"
+    assert P.text_line_at(SAMPLE, 0, x, y, 0, None) is None  # an unread scan has no text to pick
+
+
+def test_shapes_lines_stamps_and_markup_are_drawn_where_placed():
+    blank = fitz.open()
+    blank.new_page()
+    pdf = blank.tobytes()
+    edits = [
+        {"kind": "rect", "rect": [100, 100, 200, 160], "rotation": 0, "color": "#000000", "width": 3, "fill": ""},
+        {"kind": "ellipse", "rect": [300, 100, 400, 160], "rotation": 0, "color": "#000000", "width": 0,
+         "fill": "#000000", "opacity": 100},
+        {"kind": "arrow", "rect": [100, 300, 300, 300], "line": [100, 300, 300, 300], "rotation": 0,
+         "color": "#000000", "width": 3},
+        {"kind": "line", "rect": [100, 400, 100, 500], "line": [100, 400, 100, 500], "rotation": 0,
+         "color": "#000000", "width": 4},
+        {"kind": "stamp", "rect": [300, 400, 500, 460], "rotation": 0, "text": "PAID", "color": "#000000"},
+        {"kind": "underline", "rect": [100, 600, 300, 620], "rotation": 0, "color": "#000000"},
+        {"kind": "strike", "rect": [100, 650, 300, 670], "rotation": 0, "color": "#000000"},
+    ]
+    out, _ = P.build_pdf(pdf, edits={0: edits})
+    assert _ink(out, (96, 96, 204, 164)) > 300          # rectangle outline
+    assert _ink(out, (120, 115, 180, 145)) == 0         # ...and nothing inside it
+    assert _ink(out, (330, 115, 370, 145)) > 1000       # filled ellipse
+    assert _ink(out, (285, 290, 302, 310)) > 40         # arrow head at the tip
+    assert _ink(out, (96, 400, 104, 500)) > 250         # vertical line, although its box has no width
+    assert _ink(out, (100, 615, 300, 622)) > 100 and _ink(out, (100, 600, 300, 612)) == 0  # underline at the foot
+    assert _ink(out, (100, 656, 300, 664)) > 100        # strike through the middle
+    with fitz.open(stream=out) as doc:
+        assert "PAID" in doc[0].get_text()
+    # an arrow drawn on a turned page stays where it was drawn
+    turned, _ = P.build_pdf(pdf, rotations={0: 90}, edits={0: [dict(edits[2], rotation=90)]})
+    assert _ink(turned, (285, 290, 302, 310)) > 40
+
+
+def test_comment_becomes_a_sticky_note():
+    pdf = _typed_pdf()
+    note = {"kind": "comment", "rect": [420, 80, 438, 98], "rotation": 0, "text": "Check this date"}
+    out, _ = P.build_pdf(pdf, edits={0: [note, {**note, "text": "  "}]})
+    with fitz.open(stream=out) as doc:
+        page = doc[0]  # annotations are only valid while their page object is alive
+        notes = list(page.annots())
+        assert [n.info["content"] for n in notes] == ["Check this date"]
+        assert abs(notes[0].rect.x0 - 420) < 3 and abs(notes[0].rect.y0 - 80) < 3
+
+
+def test_objects_can_be_picked_moved_and_resized():
+    box = {"kind": "rect", "rect": [100, 100, 300, 300], "rotation": 0, "fill": ""}
+    filled = {"kind": "cover", "rect": [100, 100, 300, 300], "rotation": 0}
+    arrow = {"kind": "arrow", "rect": [0, 0, 200, 200], "line": [0, 0, 200, 200], "rotation": 0}
+    assert P.hit_test([box], 101, 200) == 0          # on the outline
+    assert P.hit_test([box], 200, 200) is None       # inside an unfilled outline: reach what it surrounds
+    assert P.hit_test([box, filled], 200, 200) == 1  # topmost first
+    assert P.hit_test([arrow], 100, 102) == 0 and P.hit_test([arrow], 180, 20) is None
+    shifted = P.moved(arrow, 10, -5)
+    assert shifted["rect"] == [10, -5, 210, 195] and shifted["line"] == [10, -5, 210, 195]
+    assert arrow["line"] == [0, 0, 200, 200]         # the original is left alone, for undo
+    assert P.resized(arrow, [0, 0, 100, 400])["line"] == [0, 0, 100, 400]
+    # an object drawn before the page was turned can be found at its new place
+    pdf = _typed_pdf()
+    there = P.transformed({"kind": "cover", "rect": [60, 66, 260, 84]}, P.rotation_map(pdf, 0, 0, 90))
+    x0, y0, x1, y1 = there["rect"]
+    assert _ink(pdf, (x0, y0, x1, y1), rotation=90) > 200  # the first line of text really is there
+    back = P.carry(((x0 + x1) / 2, (y0 + y1) / 2), P.rotation_map(pdf, 0, 90, 0))
+    assert abs(back[0] - 160) < 0.01 and abs(back[1] - 75) < 0.01
+
+
+def test_form_fields_are_listed_and_filled():
+    doc = fitz.open()
+    page = doc.new_page()
+    for kind, name, rect in ((fitz.PDF_WIDGET_TYPE_TEXT, "name", (60, 100, 300, 122)),
+                             (fitz.PDF_WIDGET_TYPE_CHECKBOX, "agree", (60, 140, 76, 156)),
+                             (fitz.PDF_WIDGET_TYPE_COMBOBOX, "city", (60, 170, 200, 190))):
+        widget = fitz.Widget()
+        widget.field_type, widget.field_name, widget.rect = kind, name, fitz.Rect(rect)
+        if name == "city":
+            widget.choice_values = ["Pune", "Mumbai"]
+        page.add_widget(widget)
+    pdf = doc.tobytes()
+    fields = {f["name"]: f for f in P.form_fields(pdf)}
+    assert [fields[n]["kind"] for n in ("name", "agree", "city")] == ["text", "checkbox", "choice"]
+    assert fields["city"]["options"] == ["Pune", "Mumbai"] and fields["agree"]["value"] is False
+    assert P.form_fields(_typed_pdf()) == []
+    out, _ = P.build_pdf(pdf, fields={"name": "Asha Rao", "agree": True, "city": "Mumbai"})
+    filled = {f["name"]: f["value"] for f in P.form_fields(out)}
+    assert filled == {"name": "Asha Rao", "agree": True, "city": "Mumbai"}
+    assert _ink(out, (60, 100, 300, 122)) > 50  # the typed name shows on the page
+
+
+def test_blank_and_duplicate_pages_and_signature_cleanup():
+    pdf = _typed_pdf()
+    longer = P.add_blank_page(P.duplicate_page(pdf, 0))
+    with fitz.open(stream=longer) as doc:
+        assert len(doc) == 3 and doc[2].rect == doc[0].rect
+        assert "Invoice number 2291" in doc[1].get_text() and not doc[2].get_text().strip()
+    full = fitz.open()
+    for _ in range(P.MAX_PAGES):
+        full.new_page()
+    with pytest.raises(P.PdfError):
+        P.add_blank_page(full.tobytes())
+    import io
+    from PIL import Image, ImageDraw
+    paper = Image.new("RGB", (120, 60), "white")
+    ImageDraw.Draw(paper).line([10, 30, 110, 30], fill=(20, 20, 60), width=6)
+    raw = io.BytesIO()
+    paper.save(raw, "PNG")
+    clean = Image.open(io.BytesIO(P.transparent_background(raw.getvalue())))
+    assert clean.mode == "RGBA" and clean.getpixel((5, 5))[3] == 0 and clean.getpixel((60, 30))[3] == 255
+    assert P.image_size(raw.getvalue()) == (120, 60)
+    with pytest.raises(P.PdfError):
+        P.image_size(b"not a picture")

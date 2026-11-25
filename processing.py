@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterable
 
 import fitz
 import pytesseract
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageOps
 from pytesseract import Output
 
 MAX_BYTES = 10 * 1024 * 1024
@@ -53,6 +53,18 @@ _FONT_CANDIDATES = {
         "/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf",
         "/System/Library/Fonts/Supplemental/Devanagari Sangam MN.ttc",
         "C:/Windows/Fonts/Nirmala.ttf",
+    ),
+    "devanagari-bold": (
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Bold.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansDevanagari-Bold.otf",
+    ),
+    "latin-bold": (
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
     ),
     "latin": (
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
@@ -169,11 +181,14 @@ def _open_page(pdf_bytes: bytes, page_no: int, extra_rotation: int) -> tuple[fit
 
 
 def render_page(pdf_bytes: bytes, page_no: int, dpi: int = 110, extra_rotation: int = 0,
-                edits: list[dict[str, Any]] | None = None) -> Image.Image:
-    """Render one page as it will look after `extra_rotation` and any `edits` are applied."""
+                edits: list[dict[str, Any]] | None = None,
+                fields: dict[str, Any] | None = None) -> Image.Image:
+    """Render one page as it will look after `extra_rotation`, form `fields` and `edits` are applied."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[page_no]
     base = page.rotation
+    if fields:
+        _fill_fields(page, fields)
     if edits:
         apply_edits(page, edits, base)
     page.set_rotation((base + extra_rotation) % 360)
@@ -384,13 +399,42 @@ def _font(kind: str) -> fitz.Font:
                 return fitz.Font(fontfile=path)
             except Exception:  # noqa: BLE001 - try the next candidate
                 continue
+    if kind.endswith("-bold"):
+        return _font(kind[:-5])
     return fitz.Font("helv")
 
 
+def _is_devanagari(text: str) -> bool:
+    return any("\u0900" <= ch <= "\u097f" for ch in text)
+
+
 def _font_for(text: str) -> fitz.Font:
-    if any("\u0900" <= ch <= "\u097f" for ch in text):
-        return _font("devanagari")
-    return _font("latin")
+    return _font("devanagari" if _is_devanagari(text) else "latin")
+
+
+FONT_FAMILIES = ("sans", "serif", "mono")
+# PDF's built-in faces, by family: regular, bold, italic, bold italic.
+_BASE14 = {
+    "sans": ("helv", "hebo", "heit", "hebi"),
+    "serif": ("tiro", "tibo", "tiit", "tibi"),
+    "mono": ("cour", "cobo", "coit", "cobi"),
+}
+
+
+@lru_cache(maxsize=12)
+def _base14(code: str) -> fitz.Font:
+    return fitz.Font(code)
+
+
+def _face(text: str, family: str = "sans", bold: bool = False, italic: bool = False) -> fitz.Font:
+    """The font for text the user adds: a built-in face when it has every
+    character, otherwise a system font with wider coverage (Hindi, symbols)."""
+    if _is_devanagari(text):
+        return _font("devanagari-bold" if bold else "devanagari")
+    face = _base14(_BASE14.get(family, _BASE14["sans"])[int(bool(bold)) + 2 * int(bool(italic))])
+    if all(ch.isspace() or face.has_glyph(ord(ch)) for ch in text):
+        return face
+    return _font("latin-bold" if bold else "latin")
 
 
 def _write(page: fitz.Page, writer: fitz.TextWriter, turn: tuple[fitz.Point, float] | None = None,
@@ -489,15 +533,23 @@ def _add_note(page: fitz.Page, note: dict[str, Any]) -> None:
 
 # -- Page edits ------------------------------------------------------------
 #
-# An edit is a dict in display space, valid for the rotation it was drawn at:
-#   {"kind": "text",      "rect": [x0, y0, x1, y1], "rotation": r, "text": str, "size": float, "color": "#rrggbb"}
-#   {"kind": "highlight", "rect": ..., "rotation": r, "color": "#rrggbb"}
-#   {"kind": "cover",     "rect": ..., "rotation": r, "color": "#rrggbb"}
-#   {"kind": "redact",    "rect": ..., "rotation": r}
-#   {"kind": "image",     "rect": ..., "rotation": r, "data": bytes}
-#   {"kind": "replace",   "rect": ..., "rotation": r, "text": str, "color": "#rrggbb", "fill": "#rrggbb"}
+# An edit is a dict in display space, valid for the rotation it was drawn at.
+# Every edit has "kind", "rect" [x0, y0, x1, y1] and "rotation". By kind:
+#   text                text, size, color, font, bold, italic, align
+#   replace             text, color, fill, size, origin [x, baseline], font, bold, italic,
+#                       erase ("text" removes real PDF text, "pixels" paints over a scan),
+#                       changed (False while the wording is still the original)
+#   highlight, underline, strike, cover     color
+#   redact
+#   rect, ellipse       color, width, fill ("" for none), opacity (0-100)
+#   line, arrow         line [xa, ya, xb, yb], color, width
+#   image               data (bytes)
+#   stamp               text, color
+#   comment             text (a sticky note; rect marks where its icon sits)
 
-EDIT_KINDS = ("text", "highlight", "cover", "redact", "image", "replace")
+EDIT_KINDS = ("text", "replace", "highlight", "underline", "strike", "cover", "redact",
+              "rect", "ellipse", "line", "arrow", "image", "stamp", "comment")
+_ALIGN = {"left": 0, "center": 1, "right": 2}
 
 
 def _rgb(color: str) -> tuple[float, float, float]:
@@ -514,59 +566,287 @@ def apply_edits(page: fitz.Page, edits: list[dict[str, Any]], base_rotation: int
     so it stays glued to the content if the page is turned afterwards.
     Leaves the page's rotation changed; the caller sets the final one."""
     for edit in edits:
+        kind = edit["kind"]
+        if kind == "replace" and edit.get("changed") is False:
+            continue  # a line picked for editing whose wording was left alone
         page.set_rotation((base_rotation + edit.get("rotation", 0)) % 360)
+        if kind in ("line", "arrow"):
+            _draw_line(page, edit)
+            continue
         display = fitz.Rect(edit["rect"]).normalize() & page.rect
         if display.is_empty or display.width < 1 or display.height < 1:
             continue
         own = display * page.derotation_matrix  # the page's unrotated space
         own.normalize()
-        kind = edit["kind"]
+        color = edit.get("color") or "#16202c"
         if kind == "highlight":
             page.draw_rect(own, color=None, fill=_rgb(edit.get("color", "#ffd60a")), fill_opacity=0.4, overlay=True)
+        elif kind in ("underline", "strike"):
+            y = display.y1 - 0.06 * display.height if kind == "underline" else display.y0 + 0.52 * display.height
+            a, b = (fitz.Point(x, y) * page.derotation_matrix for x in (display.x0, display.x1))
+            page.draw_line(a, b, color=_rgb(color), width=max(0.7, min(2.5, display.height * 0.07)), overlay=True)
         elif kind == "cover":
             page.draw_rect(own, color=None, fill=_rgb(edit.get("color", "#ffffff")), overlay=True)
         elif kind == "redact":
             page.add_redact_annot(own, fill=(0, 0, 0))
             page.apply_redactions()  # removes the text and image pixels underneath, not just hides them
+        elif kind in ("rect", "ellipse"):
+            width = float(edit.get("width", 2))
+            fill = edit.get("fill") or None
+            if width <= 0 and not fill:
+                continue
+            opacity = max(0.05, min(1.0, float(edit.get("opacity", 100)) / 100))
+            draw = page.draw_rect if kind == "rect" else page.draw_oval
+            draw(own, color=_rgb(color) if width > 0 else None, fill=_rgb(fill) if fill else None,
+                 width=width or 1, stroke_opacity=opacity, fill_opacity=opacity, overlay=True)
         elif kind == "image":
             page.insert_image(own, stream=edit["data"], rotate=page.rotation, keep_proportion=True, overlay=True)
         elif kind == "text":
-            _text_in_box(page, display, edit["text"], float(edit.get("size", 12)), edit.get("color", "#16202c"))
+            _text_in_box(page, display, edit)
+        elif kind == "stamp":
+            _stamp(page, display, own, edit.get("text", "").strip(), _rgb(edit.get("color", "#1f3fbf")))
+        elif kind == "comment":
+            if edit.get("text", "").strip():
+                _comment(page, display, edit["text"].strip())
         elif kind == "replace":
-            page.add_redact_annot(own, fill=_rgb(edit.get("fill", "#ffffff")))
-            page.apply_redactions()
-            text = edit.get("text", "").strip()
-            if text:
-                writer = fitz.TextWriter(page.rect)
-                _fit(writer, text, display.x0, display.x1, display.y1 - 0.2 * display.height,
-                     display.height / 1.6, pad="")
-                _write(page, writer, color=_rgb(edit.get("color", "#16202c")))
+            _replace(page, display, own, edit)
 
 
-def _text_in_box(page: fitz.Page, box: fitz.Rect, text: str, size: float, color: str) -> None:
+def _draw_line(page: fitz.Page, edit: dict[str, Any]) -> None:
+    xa, ya, xb, yb = edit.get("line") or edit["rect"]
+    length = math.hypot(xb - xa, yb - ya)
+    if length < 1:
+        return
+    width = max(0.3, float(edit.get("width", 2)))
+    ink = _rgb(edit.get("color") or "#b93520")
+    own = page.derotation_matrix
+    start, tip = fitz.Point(xa, ya), fitz.Point(xb, yb)
+    shape = page.new_shape()
+    if edit["kind"] == "arrow":
+        head = min(length * 0.6, max(9.0, width * 4.5))
+        ux, uy = (xb - xa) / length, (yb - ya) / length
+        neck = fitz.Point(xb - ux * head, yb - uy * head)
+        wing = head * 0.42
+        corners = [fitz.Point(neck.x - uy * wing, neck.y + ux * wing), tip,
+                   fitz.Point(neck.x + uy * wing, neck.y - ux * wing)]
+        shape.draw_line(start * own, fitz.Point(xb - ux * head * 0.8, yb - uy * head * 0.8) * own)
+        shape.finish(color=ink, width=width, closePath=False)
+        shape.draw_polyline([p * own for p in corners])
+        shape.finish(color=ink, fill=ink, width=0.3, closePath=True)
+    else:
+        shape.draw_line(start * own, tip * own)
+        shape.finish(color=ink, width=width, closePath=False, lineCap=1)
+    shape.commit(overlay=True)
+
+
+def _text_in_box(page: fitz.Page, box: fitz.Rect, edit: dict[str, Any]) -> None:
     """Wrap text inside a box, shrinking it if needed so that all of it fits."""
+    text = edit.get("text", "")
     if not text.strip():
         return
-    font = _font_for(text)
+    size = float(edit.get("size", 12))
+    font = _face(text, edit.get("font", "sans"), edit.get("bold", False), edit.get("italic", False))
+    ink = _rgb(edit.get("color") or "#16202c")
+    align = _ALIGN.get(edit.get("align", "left"), 0)
     for attempt in (size, size * 0.85, size * 0.7, size * 0.55, size * 0.4, 4):
         writer = fitz.TextWriter(page.rect)
         try:
-            leftover = writer.fill_textbox(box, text, font=font, fontsize=attempt)
+            leftover = writer.fill_textbox(box, text, font=font, fontsize=attempt, align=align)
         except Exception:  # noqa: BLE001 - box too small for one line at this size
             leftover = [1]
         if not leftover:
-            _write(page, writer, color=_rgb(color))
+            _write(page, writer, color=ink)
             return
     # Too small to wrap at any size: write one line from the box's top-left.
     writer = fitz.TextWriter(page.rect)
     writer.append(fitz.Point(box.x0, box.y0 + size), text.splitlines()[0], font=font, fontsize=size)
-    _write(page, writer, color=_rgb(color))
+    _write(page, writer, color=ink)
+
+
+def _stamp(page: fitz.Page, display: fitz.Rect, own: fitz.Rect, text: str,
+           ink: tuple[float, float, float]) -> None:
+    """A rubber stamp: bold wording inside a rounded frame, sized to its box."""
+    if not text:
+        return
+    font = _face(text, "sans", bold=True)
+    unit = font.text_length(text, fontsize=1)
+    if unit <= 0:
+        return
+    size = max(4.0, min(display.height * 0.5, display.width * 0.82 / unit))
+    page.draw_rect(own, color=ink, width=max(1.0, min(3.0, display.height * 0.06)), radius=0.2, overlay=True)
+    writer = fitz.TextWriter(page.rect)
+    centre = (display.tl + display.br) / 2
+    writer.append(fitz.Point(centre.x - unit * size / 2, centre.y + size * 0.36), text, font=font, fontsize=size)
+    _write(page, writer, color=ink)
+
+
+def _comment(page: fitz.Page, display: fitz.Rect, text: str) -> None:
+    """A sticky note that PDF readers show as an icon with pop-up text."""
+    annot = page.add_text_annot(display.tl * page.derotation_matrix, text, icon="Comment")
+    annot.set_info(title="FolioDesk")
+    annot.update()
+
+
+def _replace(page: fitz.Page, display: fitz.Rect, own: fitz.Rect, edit: dict[str, Any]) -> None:
+    """Take existing wording off the page and write new wording in its place."""
+    # Real text is removed through a thin band along the middle of the line, so
+    # neighbouring lines whose boxes overlap this one keep all their letters.
+    band = fitz.Rect(display.x0, display.y0 + 0.3 * display.height, display.x1, display.y1 - 0.3 * display.height)
+    page.add_redact_annot((band * page.derotation_matrix).normalize(), fill=False)
+    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE, graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                          text=fitz.PDF_REDACT_TEXT_REMOVE)
+    if edit.get("erase", "pixels") == "pixels":
+        # On a scan the letters are part of the picture: paint the paper colour over them.
+        page.add_redact_annot(own, fill=_rgb(edit.get("fill", "#ffffff")))
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS, graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                              text=fitz.PDF_REDACT_TEXT_NONE)
+    text = edit.get("text", "").strip()
+    if not text:
+        return
+    writer = fitz.TextWriter(page.rect)
+    size = edit.get("size")
+    if size:
+        font = _face(text, edit.get("font", "sans"), edit.get("bold", False), edit.get("italic", False))
+        x, baseline = edit.get("origin") or (display.x0, display.y1 - 0.2 * display.height)
+        try:
+            writer.append(fitz.Point(x, baseline), text, font=font, fontsize=float(size))
+        except Exception:  # noqa: BLE001 - a glyph the font lacks should not sink the export
+            return
+    else:
+        _fit(writer, text, display.x0, display.x1, display.y1 - 0.2 * display.height,
+             display.height / 1.6, pad="")
+    _write(page, writer, color=_rgb(edit.get("color", "#16202c")))
+
+
+# -- Geometry helpers for the editor ---------------------------------------
+
+def rotation_map(pdf_bytes: bytes, page_no: int, from_rotation: int, to_rotation: int) -> tuple[float, ...]:
+    """A matrix (as six numbers) carrying display-space points of the page at
+    one rotation to where they sit at another."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    with doc:
+        page = doc[page_no]
+        base = page.rotation
+        page.set_rotation((base + from_rotation) % 360)
+        back = page.derotation_matrix
+        page.set_rotation((base + to_rotation) % 360)
+        return tuple(back * page.rotation_matrix)
+
+
+def carry(point: Iterable[float], matrix: Iterable[float]) -> tuple[float, float]:
+    """A point carried through a matrix from `rotation_map`."""
+    moved_point = fitz.Point(*point) * fitz.Matrix(*matrix)
+    return moved_point.x, moved_point.y
+
+
+def transformed(edit: dict[str, Any], matrix: Iterable[float]) -> dict[str, Any]:
+    """A copy of an edit with its geometry carried through `matrix`."""
+    m = fitz.Matrix(*matrix)
+    out = dict(edit)
+    out["rect"] = list((fitz.Rect(edit["rect"]) * m).normalize())
+    if edit.get("line"):
+        a, b = fitz.Point(edit["line"][:2]) * m, fitz.Point(edit["line"][2:]) * m
+        out["line"] = [a.x, a.y, b.x, b.y]
+    return out
+
+
+def moved(edit: dict[str, Any], dx: float, dy: float) -> dict[str, Any]:
+    """A copy of an edit shifted by (dx, dy)."""
+    out = dict(edit)
+    x0, y0, x1, y1 = edit["rect"]
+    out["rect"] = [x0 + dx, y0 + dy, x1 + dx, y1 + dy]
+    if edit.get("line"):
+        xa, ya, xb, yb = edit["line"]
+        out["line"] = [xa + dx, ya + dy, xb + dx, yb + dy]
+    if edit.get("origin"):
+        out["origin"] = [edit["origin"][0] + dx, edit["origin"][1] + dy]
+    return out
+
+
+def resized(edit: dict[str, Any], rect: Iterable[float]) -> dict[str, Any]:
+    """A copy of an edit stretched to fill `rect`."""
+    old = fitz.Rect(edit["rect"]).normalize()
+    new = fitz.Rect(*rect).normalize()
+    kx = new.width / old.width if old.width else 1.0
+    ky = new.height / old.height if old.height else 1.0
+
+    def carry(x: float, y: float) -> tuple[float, float]:
+        return new.x0 + (x - old.x0) * kx, new.y0 + (y - old.y0) * ky
+
+    out = dict(edit)
+    out["rect"] = list(new)
+    if edit.get("line"):
+        out["line"] = [*carry(*edit["line"][:2]), *carry(*edit["line"][2:])]
+    if edit.get("origin"):
+        out["origin"] = list(carry(*edit["origin"]))
+    return out
+
+
+def hit_test(edits: list[dict[str, Any]], x: float, y: float, reach: float = 4.0) -> int | None:
+    """Index of the topmost edit under a point, or None. Outlines without a
+    fill are only hit near their edge, so what they surround stays reachable."""
+    point = fitz.Point(x, y)
+    for i in range(len(edits) - 1, -1, -1):
+        edit = edits[i]
+        box = fitz.Rect(edit["rect"]).normalize()
+        if not fitz.Rect(box.x0 - reach, box.y0 - reach, box.x1 + reach, box.y1 + reach).contains(point):
+            continue
+        kind = edit["kind"]
+        if kind in ("line", "arrow") and edit.get("line"):
+            xa, ya, xb, yb = edit["line"]
+            span = (xb - xa) ** 2 + (yb - ya) ** 2
+            t = 0.0 if span == 0 else max(0.0, min(1.0, ((x - xa) * (xb - xa) + (y - ya) * (yb - ya)) / span))
+            if math.hypot(x - (xa + t * (xb - xa)), y - (ya + t * (yb - ya))) > reach + 3:
+                continue
+        elif kind in ("rect", "ellipse") and not edit.get("fill"):
+            edge = reach + 3
+            inner = fitz.Rect(box.x0 + edge, box.y0 + edge, box.x1 - edge, box.y1 - edge)
+            if inner.x0 < inner.x1 and inner.y0 < inner.y1 and inner.contains(point):
+                continue
+        return i
+    return None
+
+
+# -- Finding existing text --------------------------------------------------
+
+def _over_image(page: fitz.Page, box: fitz.Rect) -> bool:
+    """True when a picture lies under the middle of `box` (display space), as on a scan."""
+    centre = (box.tl + box.br) / 2
+    for info in page.get_image_info():
+        if (fitz.Rect(info["bbox"]) * page.rotation_matrix).normalize().contains(centre):
+            return True
+    return False
+
+
+def _fit_size(text: str, box: fitz.Rect, font: fitz.Font | None = None) -> float:
+    """The font size at which `text` is as wide as `box`."""
+    unit = (font or _face(text)).text_length(text, fontsize=1)
+    if unit <= 0:
+        return max(4.0, box.height * 0.8)
+    return max(2.0, min(box.width / unit, box.height * 1.6))
+
+
+def _sample(image: Image.Image, scale: float, box: fitz.Rect) -> tuple[list[float], str, str]:
+    """A box grown slightly to cover stray pixels, with the paper and ink colours inside it."""
+    grown = fitz.Rect(box.x0 - 1, box.y0 - 1.5, box.x1 + 1, box.y1 + 1.5) & fitz.Rect(
+        0, 0, image.width / scale, image.height / scale)
+    crop = image.crop(tuple(int(v * scale) for v in grown))
+    pixels = sorted(crop.getdata(), key=sum) if crop.width and crop.height else [(255, 255, 255)]
+    paper = pixels[int(len(pixels) * 0.85)]   # the lighter bulk is the background
+    ink = pixels[int(len(pixels) * 0.03)]     # the darkest few percent is the lettering
+    return list(grown), _hex(paper), _hex(ink)
+
+
+def _snapshot(page: fitz.Page, scale: float = 2.0) -> Image.Image:
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+    return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
 
 def find_text(pdf_bytes: bytes, page_no: int, query: str, extra_rotation: int = 0,
               result: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    """Find `query` on a page. Returns display-space boxes with the colours to
-    use when replacing: the paper colour around each match and the ink colour.
+    """Find `query` on a page. Returns, per match, a display-space box plus what
+    is needed to replace it convincingly: how to erase it, the paper and ink
+    colours, and a font size at which the same words fill the same width.
 
     Looks in the PDF's own text first, then in the recognised words of a scan.
     """
@@ -575,25 +855,88 @@ def find_text(pdf_bytes: bytes, page_no: int, query: str, extra_rotation: int = 
         return []
     doc, page = _open_page(pdf_bytes, page_no, extra_rotation)
     with doc:
-        boxes = [fitz.Rect(r) * page.rotation_matrix for r in page.search_for(query)]
-        for box in boxes:
-            box.normalize()
+        boxes = [(fitz.Rect(r) * page.rotation_matrix).normalize() for r in page.search_for(query)]
+        real = bool(boxes)
         if not boxes and result and result.get("rotation", 0) == extra_rotation % 360:
             boxes = _find_in_words(result["words"], query)
         if not boxes:
             return []
-        scale = 2.0
-        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-        image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-    matches = []
-    for box in boxes:
-        grown = fitz.Rect(box.x0 - 1, box.y0 - 1.5, box.x1 + 1, box.y1 + 1.5) & fitz.Rect(0, 0, *[v / scale for v in image.size])
-        crop = image.crop(tuple(int(v * scale) for v in grown))
-        pixels = sorted(crop.getdata(), key=sum) if crop.width and crop.height else [(255, 255, 255)]
-        paper = pixels[int(len(pixels) * 0.85)]   # the lighter bulk is the background
-        ink = pixels[int(len(pixels) * 0.03)]     # the darkest few percent is the lettering
-        matches.append({"rect": list(grown), "fill": _hex(paper), "color": _hex(ink)})
+        image = _snapshot(page)
+        matches = []
+        for box in boxes:
+            grown, paper, ink = _sample(image, 2.0, box)
+            pixels = not real or _over_image(page, box)
+            matches.append({
+                "rect": grown if pixels else list(box), "fill": paper, "color": ink,
+                "erase": "pixels" if pixels else "text", "original": query,
+                "size": round(_fit_size(query, box), 2),
+                "origin": [box.x0, box.y1 - (0.2 if pixels else 0.22) * box.height],
+            })
     return matches
+
+
+def text_line_at(pdf_bytes: bytes, page_no: int, x: float, y: float, extra_rotation: int = 0,
+                 result: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """The line of text under a display-space point, ready to become a "replace"
+    edit: its wording, box, look (size, colour, font style) and how to erase it.
+
+    Looks at the PDF's own text first, then at the recognised lines of a scan.
+    """
+    point = fitz.Point(x, y)
+    doc, page = _open_page(pdf_bytes, page_no, extra_rotation)
+    with doc:
+        to_display = page.rotation_matrix
+        zero = fitz.Point(0, 0) * to_display
+        found = None
+        blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_DICT & ~fitz.TEXT_PRESERVE_IMAGES)["blocks"]
+        for line in (ln for block in blocks for ln in block.get("lines", [])):
+            box = (fitz.Rect(line["bbox"]) * to_display).normalize()
+            if not fitz.Rect(box.x0 - 1, box.y0 - 1, box.x1 + 1, box.y1 + 1).contains(point):
+                continue
+            spans = [s for s in line["spans"] if s["text"].strip()]
+            heading = fitz.Point(line["dir"]) * to_display - zero
+            if not spans or abs(heading.x - 1) > 0.02:
+                continue  # only text that runs left to right as the page is shown
+            first = spans[0]
+            start = fitz.Point(first["origin"]) * to_display
+            flags = first["flags"]
+            found = {
+                "rect": list(box), "text": "".join(s["text"] for s in line["spans"]).strip(),
+                "erase": "text", "fill": "#ffffff", "color": f"#{first['color']:06x}",
+                "size": round(first["size"], 2), "origin": [start.x, start.y],
+                "font": "mono" if flags & 8 else "serif" if flags & 4 else "sans",
+                "bold": bool(flags & 16), "italic": bool(flags & 2),
+            }
+            if _over_image(page, box):
+                found["erase"] = "pixels"  # e.g. a scan that already carries a hidden text layer
+                del found["size"]          # the hidden layer's size says little about the visible letters
+            break
+        if found is None and result and result.get("rotation", 0) == extra_rotation % 360:
+            for ln in result["lines"]:
+                if ln["text"].strip() and ln["x0"] - 2 <= x <= ln["x1"] + 2 and ln["y0"] - 2 <= y <= ln["y1"] + 2:
+                    found = {"rect": [ln["x0"], ln["y0"], ln["x1"], ln["y1"]], "text": ln["text"].strip(),
+                             "erase": "pixels", "font": "sans", "bold": False, "italic": False}
+                    # Size from the words themselves, so wide gaps in the line don't inflate it.
+                    face = _face(found["text"])
+                    sizes = sorted(
+                        (w["x1"] - w["x0"]) / face.text_length(w["text"], fontsize=1)
+                        for w in result["words"]
+                        if len(w["text"]) >= 3 and ln["x0"] - 1 <= (w["x0"] + w["x1"]) / 2 <= ln["x1"] + 1
+                        and ln["y0"] - 1 <= (w["y0"] + w["y1"]) / 2 <= ln["y1"] + 1
+                        and face.text_length(w["text"], fontsize=1) > 0)
+                    if sizes:
+                        found["size"] = round(sizes[len(sizes) // 2], 2)
+                    break
+        if found is None:
+            return None
+        if found["erase"] == "pixels":
+            box = fitz.Rect(found["rect"])
+            found["rect"], found["fill"], found["color"] = _sample(_snapshot(page), 2.0, box)
+            face = _face(found["text"], found["font"], found["bold"], found["italic"])
+            found.setdefault("size", round(_fit_size(found["text"], box, face), 2))
+            found["origin"] = [box.x0, box.y1 - 0.2 * box.height]
+    found["original"] = found["text"]
+    return found
 
 
 def _find_in_words(words: list[dict[str, Any]], query: str) -> list[fitz.Rect]:
@@ -612,6 +955,89 @@ def _find_in_words(words: list[dict[str, Any]], query: str) -> list[fitz.Rect]:
             found.append(fitz.Rect(min(w["x0"] for w in run), min(w["y0"] for w in run),
                                    max(w["x1"] for w in run), max(w["y1"] for w in run)))
     return found
+
+
+# -- Pictures, forms and extra pages ----------------------------------------
+
+def image_size(data: bytes) -> tuple[int, int]:
+    """Width and height of a picture, or raise PdfError if it cannot be read."""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            return image.size
+    except Exception as exc:  # noqa: BLE001
+        raise PdfError("That picture could not be opened. Use a PNG or JPEG file.") from exc
+
+
+def transparent_background(data: bytes, white: int = 225) -> bytes:
+    """Make a picture's white paper see-through, so a photographed signature
+    sits on the page as ink rather than as a white patch."""
+    try:
+        image = Image.open(io.BytesIO(data)).convert("RGBA")
+    except Exception as exc:  # noqa: BLE001
+        raise PdfError("That picture could not be opened. Use a PNG or JPEG file.") from exc
+    soft = max(1, white - 60)  # fully solid below this, fading to clear at `white`
+    alpha = ImageOps.grayscale(image.convert("RGB")).point(
+        lambda v: 255 if v <= soft else 0 if v >= white else int(255 * (white - v) / (white - soft)))
+    image.putalpha(ImageChops.darker(alpha, image.getchannel("A")))
+    out = io.BytesIO()
+    image.save(out, "PNG", optimize=True)
+    return out.getvalue()
+
+
+_FIELD_KINDS = {
+    fitz.PDF_WIDGET_TYPE_TEXT: "text", fitz.PDF_WIDGET_TYPE_CHECKBOX: "checkbox",
+    fitz.PDF_WIDGET_TYPE_COMBOBOX: "choice", fitz.PDF_WIDGET_TYPE_LISTBOX: "choice",
+}
+
+
+def form_fields(pdf_bytes: bytes) -> list[dict[str, Any]]:
+    """The fillable fields of a PDF form: text boxes, tick boxes and drop-downs."""
+    fields = []
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        for page in doc:
+            for widget in page.widgets() or []:
+                kind = _FIELD_KINDS.get(widget.field_type)
+                if not kind or not widget.field_name or widget.field_flags & 1:  # 1 = read-only
+                    continue
+                value = widget.field_value
+                if kind == "checkbox":
+                    value = value not in (None, False, "", "Off")
+                options = [o if isinstance(o, str) else str(o[-1]) for o in (widget.choice_values or [])]
+                fields.append({
+                    "page": page.number, "name": widget.field_name, "kind": kind,
+                    "label": widget.field_label or widget.field_name,
+                    "value": value if value is not None else "", "options": options,
+                    "multiline": bool(widget.field_flags & 4096),
+                })
+    return fields
+
+
+def _fill_fields(page: fitz.Page, values: dict[str, Any]) -> None:
+    for widget in page.widgets() or []:
+        if widget.field_name not in values or widget.field_type not in _FIELD_KINDS:
+            continue
+        value = values[widget.field_name]
+        widget.field_value = bool(value) if widget.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX else str(value)
+        widget.update()
+
+
+def add_blank_page(pdf_bytes: bytes, like_page: int | None = None) -> bytes:
+    """Append an empty page, the same size as `like_page` (default: the last page)."""
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if len(doc) >= MAX_PAGES:
+            raise PdfError(f"This document is at the {MAX_PAGES}-page limit.")
+        model = doc[like_page if like_page is not None else len(doc) - 1].rect
+        doc.new_page(-1, width=model.width, height=model.height)
+        return doc.tobytes(garbage=3, deflate=True)
+
+
+def duplicate_page(pdf_bytes: bytes, page_no: int) -> bytes:
+    """Append a copy of one page. The copy's index is the new last page."""
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if len(doc) >= MAX_PAGES:
+            raise PdfError(f"This document is at the {MAX_PAGES}-page limit.")
+        doc.fullcopy_page(page_no, -1)
+        return doc.tobytes(garbage=3, deflate=True)
 
 
 def _add_watermark(page: fitz.Page, text: str) -> None:
@@ -674,6 +1100,7 @@ def build_pdf(pdf_bytes: bytes, rotations: dict[int, int] | None = None,
               text_layer: bool = False, *,
               order: list[int] | None = None,
               edits: dict[int, list[dict[str, Any]]] | None = None,
+              fields: dict[str, Any] | None = None,
               watermark: str = "", page_numbers: bool = False,
               compress: bool = False, password: str = "") -> tuple[bytes, dict[str, Any]]:
     """Apply everything the user asked for and return the finished PDF.
@@ -695,6 +1122,8 @@ def build_pdf(pdf_bytes: bytes, rotations: dict[int, int] | None = None,
         base = page.rotation
         extra = rotations.get(page_no, 0) % 360
         page_edits = edits.get(page_no, [])
+        if fields:
+            _fill_fields(page, fields)
         redacted = any(e["kind"] == "redact" for e in page_edits)
         result = results.get(page_no)
         # Pages that already carry text need no layer; stale results (page rotated

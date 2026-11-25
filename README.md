@@ -1,26 +1,52 @@
-# FolioDesk — PDF + OCR POC
+# FolioDesk — PDF editor + OCR POC
 
-A CPU-based, single-service Streamlit proof of concept for scanned PDFs.
+A CPU-based, single-service Streamlit proof of concept: edit PDFs in the browser, and make scanned ones searchable.
 
 ## Included
 
-- PDF upload and validation (10 MB / 10 pages), plus a bundled sample scan to try
-- Tesseract OCR on CPU, pages read in parallel
-- Sideways pages detected and turned upright before reading
+**Editor**
+
+- A page you click and drag on, a tool palette beside it, and a panel that shows the selected object's properties and updates the page as you change them
+- Select anything you added to restyle it, drag it to move it, set its exact position and size, duplicate it, reorder it front to back, or delete it
+- Undo and redo for every change to the document, including page changes
+- Edit text: click a line to change its wording in place. On a normal PDF the original text is removed and rewritten in a matching size, colour and style; on a scan (after reading it) the old wording is painted over in the paper's colour
+- Find and replace across one page or all pages
+- Add text with a choice of font, size, colour, bold, italic and alignment (English or Hindi)
+- Highlight, underline and strike out: drag, click a line, or find words
+- Rectangles, ellipses, lines and arrows with colour, thickness, fill and opacity
+- Images, with an option to remove a white background so a photographed signature sits on the page as ink
+- Rubber stamps (APPROVED, PAID, DRAFT … or your own wording)
+- Comments: sticky notes that PDF readers show as an icon with pop-up text
+- Cover up an area, or redact it. Redaction deletes the content underneath, including the pixels of a scanned image; redacted pages get no hidden text layer
+- Fill in PDF forms: text fields, tick boxes and drop-downs
+
+**Pages**
+
+- Live thumbnails: reorder, rotate, duplicate, remove/restore, add a blank page, add pages from another PDF
+- Opens password-protected PDFs when given the password
+
+**Reading scans (OCR)**
+
+- Tesseract OCR on CPU, pages read in parallel; sideways pages are detected and turned upright first
 - Pages that already contain real text are copied exactly instead of being re-recognised
 - Words the engine was unsure about are highlighted on the page preview
 - Editable text per page; corrections are kept when you re-read the other pages
-- Searchable PDF export: invisible text placed word by word over the scan, so search hits and selections line up with the image (line by line once a page has been corrected)
-- Page tools with live thumbnails: reorder, rotate, remove/restore, add pages from another PDF, stamp a short note (English or Hindi)
-- Editor: drag a box on the page to add text, highlight, cover an area, redact, or place an image such as a signature
-- Find words on a page to highlight, redact or replace them in place (uses the PDF's own text, or the recognised words of a scan)
-- Redaction deletes the content underneath, including the pixels of a scanned image; redacted pages get no hidden text layer
-- Finishing options: page numbers, watermark, smaller file size, password protection
-- Opens password-protected PDFs when given the password
-- Extra downloads: each page as a PNG or as its own PDF, zipped
-- TXT export
 - Language list shows only the Tesseract language packs actually installed
-- No database, login, payment gateway, external AI API or permanent file storage
+
+**Export**
+
+- PDF with all edits applied, and searchable text placed word by word over scanned pages so search hits and selections line up with the image
+- Finishing options: page numbers, watermark, smaller file size, password protection
+- Extra downloads: each page as a PNG or as its own PDF (zipped), and the text as TXT
+
+Limits: 10 MB and 10 pages per document. No database, login, payment gateway, external AI API or permanent file storage.
+
+## Known limits of the editor
+
+- The page updates when you release the mouse, not while you drag, and there are no resize handles: resize with the numbers in the panel
+- Edited text is rewritten in a built-in sans, serif or typewriter face, not the document's own font, and always on one line
+- No freehand drawing
+- Hindi text is placed without complex shaping, so some conjuncts may not join as they would in print
 
 ## Code layout
 
