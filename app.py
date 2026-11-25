@@ -1,419 +1,517 @@
+"""FolioDesk: make scanned PDFs searchable, correct the text, tidy the pages.
+
+This file is the Streamlit interface only. All document work lives in processing.py.
+"""
 from __future__ import annotations
 
 import hashlib
-import io
-import os
-import re
-import shutil
-import subprocess
-from typing import Any
+import html
+from pathlib import Path
 
-import fitz
 import streamlit as st
-from PIL import Image
-import pytesseract
-from pytesseract import Output
 
-APP_NAME = "FolioDesk"
-MAX_BYTES = 10 * 1024 * 1024
-MAX_PAGES = 10
+import processing as P
 
-st.set_page_config(
-    page_title="FolioDesk · Document workshop",
-    page_icon="▤",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+SAMPLE = Path(__file__).parent / "samples" / "sample-scan.pdf"
+PREVIEW_DPI = 110
+THUMB_DPI = 45
 
-# A restrained document-workshop aesthetic: warm paper, ink, violet and acid-lime.
-st.markdown("""
+st.set_page_config(page_title="FolioDesk", page_icon="📄", layout="wide", initial_sidebar_state="collapsed")
+
+# A scanner bed: cool grey desk, white sheets, stamp-pad blue for actions and
+# highlighter yellow reserved for one job, marking words that need a second look.
+st.markdown(
+    """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap');
-:root { --ink:#191821; --muted:#777482; --paper:#f5f3ee; --panel:#fffefa; --line:#e6e2da; --violet:#8058e8; --lime:#d4f36a; }
-html, body, [class*="css"] { font-family:'DM Sans',sans-serif; color:var(--ink); }
-.stApp { background:var(--paper); }
-.block-container { max-width:1440px; padding-top:1.35rem; padding-bottom:3rem; }
+@import url('https://fonts.googleapis.com/css2?family=Mukta:wght@400;500;600;700;800&display=swap');
+:root { --desk:#E8ECF1; --sheet:#FFFFFF; --ink:#16202C; --muted:#566373; --line:#CFD7E1;
+        --stamp:#1F3FBF; --marker:#FFD60A; --strike:#B93520; }
+html, body, .stApp, .stMarkdown, button, input, textarea, label, p, li, h1, h2, h3, h4 {
+  font-family:'Mukta','Noto Sans Devanagari',system-ui,sans-serif; }
+.stApp { background:var(--desk); color:var(--ink); }
+[data-testid="stMainBlockContainer"] { max-width:1320px; padding-top:1.6rem; padding-bottom:3rem; }
 header[data-testid="stHeader"] { background:transparent; }
 #MainMenu, footer { visibility:hidden; }
-.brandline { display:flex; align-items:center; gap:12px; padding:4px 0 18px; border-bottom:1px solid var(--line); margin-bottom:26px; }
-.brandmark { width:38px; height:38px; border-radius:11px; display:grid; place-items:center; background:var(--ink); color:var(--lime); font-size:22px; font-weight:700; }
-.brandname { font:800 19px 'Manrope',sans-serif; letter-spacing:-.7px; }
-.brandmeta { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:1.6px; margin-left:auto; font-family:'DM Mono',monospace; }
-.eyebrow { color:var(--violet); text-transform:uppercase; letter-spacing:2px; font:500 10px 'DM Mono',monospace; margin-bottom:8px; }
-.hero-title { font:800 clamp(30px,4vw,48px) 'Manrope',sans-serif; letter-spacing:-2.2px; line-height:1.05; margin:0; color:var(--ink); }
-.hero-copy { color:var(--muted); font-size:14px; max-width:620px; line-height:1.7; margin-top:12px; }
-.section-kicker { font:500 11px 'DM Mono',monospace; text-transform:uppercase; letter-spacing:1.4px; color:var(--muted); margin:18px 0 10px; }
-.paper-card { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:18px 20px; }
-.metric { font:800 25px 'Manrope',sans-serif; letter-spacing:-1px; }
-.metric-label { color:var(--muted); text-transform:uppercase; font:500 10px 'DM Mono',monospace; letter-spacing:1.1px; margin-top:3px; }
-.note { border-left:3px solid var(--lime); background:#fbfbeF; padding:10px 13px; color:#55515e; font-size:12px; line-height:1.55; border-radius:0 8px 8px 0; }
-.step-tag { display:inline-block; background:#eeebf8; color:#5f42b5; border-radius:5px; padding:4px 7px; font:500 10px 'DM Mono',monospace; letter-spacing:.5px; }
-div[data-testid="stFileUploader"] { background:#fffefa; border:1px dashed #c9c2d7; border-radius:14px; padding:12px; }
-div[data-testid="stFileUploader"] section { background:transparent; }
-.stButton > button, .stDownloadButton > button { border-radius:8px; border:1px solid var(--ink); background:var(--ink); color:white; font-weight:600; min-height:42px; padding:0 17px; }
-.stButton > button:hover, .stDownloadButton > button:hover { border-color:var(--violet); background:var(--violet); color:white; }
-button[kind="secondary"] { background:#fffefa; color:var(--ink); border:1px solid var(--line); }
-.stTextArea textarea, .stTextInput input, .stSelectbox div[data-baseweb="select"] { background:#fffefa; border-color:var(--line); border-radius:8px; }
-.stTabs [data-baseweb="tab-list"] { gap:8px; border-bottom:1px solid var(--line); }
-.stTabs [data-baseweb="tab"] { background:transparent; border-radius:8px 8px 0 0; padding:12px 15px; color:var(--muted); font-weight:600; }
-.stTabs [aria-selected="true"] { color:var(--violet) !important; border-bottom:2px solid var(--violet); }
-div[data-testid="stAlert"] { border-radius:10px; }
-div[data-testid="stProgress"] > div > div { background:var(--violet); }
-hr { border-color:var(--line); }
-.small-mono { color:var(--muted); font:11px 'DM Mono',monospace; }
-.preview-frame { background:#e9e6df; border:1px solid var(--line); border-radius:12px; padding:12px; text-align:center; }
-.footerline { margin-top:40px; padding-top:14px; border-top:1px solid var(--line); color:#928e99; font:10px 'DM Mono',monospace; letter-spacing:1px; text-transform:uppercase; }
+
+.fd-top { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; padding-bottom:12px;
+          border-bottom:2px solid var(--ink); margin-bottom:22px; }
+.fd-brand { font-weight:800; font-size:22px; letter-spacing:-.4px; }
+.fd-file { font-weight:600; font-size:17px; overflow-wrap:anywhere; }
+.fd-meta { color:var(--muted); font-size:15px; }
+.fd-h1 { font-weight:800; font-size:clamp(34px,4.6vw,58px); line-height:1.02; letter-spacing:-1.6px;
+         margin:18px 0 14px; max-width:13ch; }
+.fd-lede { font-size:18px; line-height:1.55; color:#2B3644; max-width:52ch; margin-bottom:22px; }
+.fd-h2 { font-weight:700; font-size:20px; margin:4px 0 2px; }
+.fd-help { color:var(--muted); font-size:15px; line-height:1.5; margin:0 0 12px; max-width:70ch; }
+.fd-status { font-size:15.5px; line-height:1.5; padding:9px 12px; background:var(--sheet);
+             border:1px solid var(--line); border-left:4px solid var(--stamp); border-radius:4px; margin-bottom:10px; }
+.fd-status.warn { border-left-color:var(--strike); }
+.fd-status mark { background:var(--marker); color:var(--ink); padding:0 4px; border-radius:2px; }
+.fd-cap { color:var(--muted); font-size:14.5px; margin-top:2px; }
+.fd-cap.removed { color:var(--strike); font-weight:600; }
+.fd-list { margin:0; padding-left:18px; font-size:16px; line-height:1.7; }
+
+[data-testid="stImage"] img { background:var(--sheet); border:1px solid var(--line); border-radius:2px;
+  box-shadow:0 1px 0 #fff inset, 0 10px 24px -14px rgba(22,32,44,.45); }
+[data-testid="stFileUploader"] section { background:var(--sheet); border:1.5px dashed #9AA7B7; border-radius:8px; }
+[data-testid="stFileUploader"] section:hover { border-color:var(--stamp); }
+.stButton > button, .stDownloadButton > button { border-radius:6px; font-weight:600; font-size:16px; min-height:42px; }
+.stTextArea textarea { font-size:17px; line-height:1.65; background:var(--sheet); color:var(--ink); }
+.stTabs [data-baseweb="tab-list"] { gap:4px; border-bottom:1px solid var(--line); }
+.stTabs [data-baseweb="tab"] { font-weight:600; font-size:17px; padding:10px 16px; color:var(--muted); }
+.stTabs [aria-selected="true"] { color:var(--ink); }
+:focus-visible { outline:3px solid var(--stamp); outline-offset:2px; }
+@media (max-width:640px) { .fd-h1 { letter-spacing:-1px; } [data-testid="stMainBlockContainer"] { padding-top:1rem; } }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-st.markdown("""
-<div class="brandline">
-  <div class="brandmark">F</div>
-  <div><div class="brandname">FolioDesk</div><div class="small-mono">DOCUMENT WORKSHOP / POC 01</div></div>
-  <div class="brandmeta">OCR · PAGE TOOLS · EXPORT</div>
-</div>
-<div class="eyebrow">A practical workspace for scanned documents</div>
-<h1 class="hero-title">Make every page<br>work a little harder.</h1>
-<p class="hero-copy">Bring in a PDF, recognise its text, correct the result, and export a searchable copy. Or make straightforward page-level changes before you send it on.</p>
-""", unsafe_allow_html=True)
 
-def get_tesseract_status() -> tuple[bool, str]:
-    path = shutil.which("tesseract")
-    if not path:
-        return False, "Tesseract is not installed on this server."
+# --------------------------------------------------------------------------
+# Cached helpers
+# --------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False, ttl=300)
+def engine() -> dict:
+    return P.tesseract_status()
+
+
+@st.cache_data(show_spinner=False, max_entries=96)
+def page_image(file_key: str, page_no: int, dpi: int, rotation: int, _pdf_bytes: bytes):
+    return P.render_page(_pdf_bytes, page_no, dpi, rotation)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def export_pdf(file_key: str, rotations: dict, removed: tuple, notes: list, results: dict, texts: dict,
+               text_layer: bool, _pdf_bytes: bytes):
+    return P.build_pdf(_pdf_bytes, rotations, removed, notes, results, texts, text_layer)
+
+
+# --------------------------------------------------------------------------
+# Session state
+# --------------------------------------------------------------------------
+
+def load_document(name: str, pdf_bytes: bytes) -> None:
+    """Validate a file and make it the open document. Records the reason if it can't be used."""
     try:
-        version = subprocess.check_output([path, "--version"], stderr=subprocess.STDOUT, text=True, timeout=5).splitlines()[0]
-        return True, version
-    except Exception as exc:
-        return False, f"Tesseract could not start: {exc}"
-
-def lang_code(choice: str) -> str:
-    return {
-        "English": "eng",
-        "Hindi": "hin",
-        "Hindi + English": "hin+eng",
-        "French": "fra",
-        "German": "deu",
-        "Spanish": "spa",
-    }[choice]
-
-def render_page(doc: fitz.Document, page_no: int, scale: float = 1.35) -> Image.Image:
-    pix = doc[page_no].get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
-    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-
-def ocr_page(image: Image.Image, language: str) -> tuple[str, list[dict[str, Any]]]:
-    data = pytesseract.image_to_data(image, lang=language, output_type=Output.DICT, config="--oem 1 --psm 3")
-    words = []
-    lines = []
-    current_line = None
-    for i, raw in enumerate(data["text"]):
-        word = str(raw).strip()
-        if not word:
-            continue
-        conf = data["conf"][i]
-        try:
-            confidence = float(conf)
-        except (TypeError, ValueError):
-            confidence = -1
-        item = {
-            "text": word,
-            "left": int(data["left"][i]),
-            "top": int(data["top"][i]),
-            "width": int(data["width"][i]),
-            "height": int(data["height"][i]),
-            "confidence": confidence,
-            "block": int(data["block_num"][i]),
-            "par": int(data["par_num"][i]),
-            "line": int(data["line_num"][i]),
-        }
-        words.append(item)
-        line_key = (item["block"], item["par"], item["line"])
-        if current_line is None or current_line[0] != line_key:
-            lines.append([line_key, []])
-            current_line = lines[-1]
-        current_line[1].append(word)
-    text = "\n".join(" ".join(parts) for _, parts in lines)
-    return text, words
-
-def make_searchable_pdf(pdf_bytes: bytes, corrected_text: dict[int, str], lang: str) -> bytes:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    for page_no, text in corrected_text.items():
-        if page_no < 0 or page_no >= len(doc) or not text.strip():
-            continue
-        page = doc[page_no]
-        rect = page.rect
-        # Invisible text layer. The font is selected to support Devanagari where available.
-        fontfile = None
-        if "hin" in lang:
-            candidates = [
-                "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-                "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Regular.ttf",
-            ]
-            fontfile = next((p for p in candidates if os.path.exists(p)), None)
-        if not fontfile:
-            candidates = ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"]
-            fontfile = next((p for p in candidates if os.path.exists(p)), None)
-        box = fitz.Rect(8, 8, rect.width - 8, rect.height - 8)
-        try:
-            page.insert_textbox(
-                box, text, fontfile=fontfile, fontsize=7,
-                color=(0, 0, 0), render_mode=3, overlay=True,
-                lineheight=1.15,
-            )
-        except Exception:
-            # A searchable text layer is best-effort; preserve the visual PDF regardless.
-            page.insert_text((10, rect.height - 10), text[:2000], fontsize=1, render_mode=3)
-    return doc.tobytes(garbage=4, deflate=True)
-
-def safe_filename(name: str) -> str:
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", name.rsplit(".", 1)[0]).strip("-") or "document"
-    return stem[:70]
-
-# Upload and document state
-left, right = st.columns([1.35, 0.65], gap="large")
-with left:
-    st.markdown('<div class="section-kicker">01 / Bring in a document</div>', unsafe_allow_html=True)
-    uploaded = st.file_uploader("Choose a PDF to work on", type=["pdf"], help="POC limit: 10 MB and 10 pages. Password-protected PDFs are not supported.")
-with right:
-    st.markdown('<div class="section-kicker">02 / Runtime check</div>', unsafe_allow_html=True)
-    ok, status = get_tesseract_status()
-    st.markdown(f'<div class="paper-card"><div class="metric">{"Ready" if ok else "Needs setup"}</div><div class="metric-label">CPU OCR engine</div><div class="small-mono" style="margin-top:10px">{status}</div></div>', unsafe_allow_html=True)
-
-if uploaded is None:
-    st.markdown('<div class="note" style="margin-top:16px">Start with a PDF. The demo processes pages on the CPU, one at a time. Files are held in memory for this session and are not intentionally saved to permanent storage.</div>', unsafe_allow_html=True)
-    st.markdown('<div class="footerline">Foliodesk · Local-first document handling · Demonstration build</div>', unsafe_allow_html=True)
-    st.stop()
-
-pdf_bytes = uploaded.getvalue()
-if len(pdf_bytes) > MAX_BYTES:
-    st.error("This POC accepts PDFs up to 10 MB. Please reduce the file size and try again.")
-    st.stop()
-
-file_key = hashlib.sha256(pdf_bytes).hexdigest()
-if st.session_state.get("file_key") != file_key:
-    try:
-        probe = fitz.open(stream=pdf_bytes, filetype="pdf")
-        if probe.needs_pass:
-            st.error("This PDF is password-protected. Please upload an unlocked copy.")
-            st.stop()
-        if len(probe) > MAX_PAGES:
-            st.error(f"This POC is limited to {MAX_PAGES} pages. Your file has {len(probe)} pages.")
-            st.stop()
-        if len(probe) == 0:
-            st.error("The PDF has no pages.")
-            st.stop()
-    except Exception as exc:
-        st.error(f"Could not read this PDF: {exc}")
-        st.stop()
+        pages = P.inspect_pdf(pdf_bytes)
+    except P.PdfError as exc:
+        st.session_state["load_error"] = str(exc)
+        return
+    uploads = st.session_state.get("uploads", 0)
     st.session_state.clear()
-    st.session_state["file_key"] = file_key
-    st.session_state["filename"] = uploaded.name
-    st.session_state["pdf_bytes"] = pdf_bytes
-    st.session_state["page_count"] = len(probe)
-    st.session_state["ocr_text"] = {}
-    st.session_state["ocr_words"] = {}
-    st.session_state["rotations"] = {}
-    st.session_state["deleted_pages"] = set()
-    st.session_state["added_text"] = {}
-    st.session_state["ocr_language"] = "Hindi + English"
-    st.session_state["ocr_complete"] = False
-    probe.close()
+    st.session_state.update(
+        uploads=uploads, file_key=hashlib.sha256(pdf_bytes).hexdigest(), filename=name, pdf_bytes=pdf_bytes,
+        page_count=pages, current=0,
+        results={},    # page -> recognition result
+        texts={},      # page -> text as corrected by the user
+        rotations={},  # page -> extra clockwise degrees
+        removed=set(), notes=[], notices=[],
+    )
 
-doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-page_count = len(doc)
-st.markdown(f"""
-<div style="display:flex;align-items:center;gap:12px;margin:20px 0 8px">
-  <span class="step-tag">OPEN DOCUMENT</span>
-  <strong style="font-family:Manrope;font-size:16px">{uploaded.name}</strong>
-  <span class="small-mono">{page_count} PAGES · {len(pdf_bytes)/1024:.0f} KB</span>
-</div>
-""", unsafe_allow_html=True)
 
-tab_read, tab_edit, tab_export = st.tabs(["01  Read & correct", "02  Page workshop", "03  Export"])
+def close_document() -> None:
+    uploads = st.session_state.get("uploads", 0) + 1
+    st.session_state.clear()
+    st.session_state["uploads"] = uploads
 
-with tab_read:
-    st.markdown('<div class="section-kicker">Recognition desk / CPU-based OCR</div>', unsafe_allow_html=True)
-    a, b = st.columns([0.72, 1.28], gap="large")
-    with a:
-        page_options = [f"Page {i+1}" for i in range(page_count)]
-        selected_label = st.selectbox("Preview page", page_options, key="preview_page")
-        preview_no = int(selected_label.split()[-1]) - 1
-        st.image(render_page(doc, preview_no), use_container_width=True, caption=f"Original page {preview_no+1}")
-    with b:
-        language = st.selectbox(
-            "Recognition language",
-            ["Hindi + English", "English", "Hindi", "French", "German", "Spanish"],
-            index=0,
-            help="Hindi and English language data are included in the Render setup. Other languages require their Tesseract traineddata packages.",
+
+def set_text(page_no: int, text: str) -> None:
+    st.session_state["texts"][page_no] = text
+    st.session_state[f"text_{page_no}"] = text
+
+
+def keep_edit(page_no: int) -> None:
+    st.session_state["texts"][page_no] = st.session_state[f"text_{page_no}"]
+
+
+def is_edited(page_no: int) -> bool:
+    s = st.session_state
+    return page_no in s["results"] and s["texts"].get(page_no) != s["results"][page_no]["text"]
+
+
+def is_stale(page_no: int) -> bool:
+    """True when the page was rotated after it was recognised."""
+    s = st.session_state
+    result = s["results"].get(page_no)
+    return bool(result) and result["rotation"] != s["rotations"].get(page_no, 0)
+
+
+def rotate(page_no: int, degrees: int) -> None:
+    rotations = st.session_state["rotations"]
+    rotations[page_no] = (rotations.get(page_no, 0) + degrees) % 360
+
+
+def toggle_removed(page_no: int) -> None:
+    st.session_state["removed"] ^= {page_no}
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+# --------------------------------------------------------------------------
+# Landing
+# --------------------------------------------------------------------------
+
+def landing() -> None:
+    status = engine()
+    st.markdown('<div class="fd-top"><span class="fd-brand">FolioDesk</span></div>', unsafe_allow_html=True)
+    left, right = st.columns([1.15, 0.85], gap="large")
+    with left:
+        st.markdown(
+            '<h1 class="fd-h1">Make a scanned PDF searchable.</h1>'
+            '<p class="fd-lede">Upload a scan in English or Hindi. FolioDesk reads every page, marks the words '
+            "it is unsure about so you can correct them, and gives you back a PDF you can search and copy from.</p>",
+            unsafe_allow_html=True,
         )
-        scope = st.radio("Pages to recognise", ["All pages", "Preview page only"], horizontal=True)
-        run_col, clear_col = st.columns([1, 1])
-        with run_col:
-            run_ocr = st.button("Run OCR on CPU", type="primary", use_container_width=True, disabled=not ok)
-        with clear_col:
-            if st.button("Clear recognised text", use_container_width=True):
-                st.session_state["ocr_text"] = {}
-                st.session_state["ocr_words"] = {}
-                st.session_state["ocr_complete"] = False
-                st.rerun()
-        if not ok:
-            st.warning("OCR is unavailable until Tesseract and its language packs are installed.")
-        if run_ocr:
-            target_pages = list(range(page_count)) if scope == "All pages" else [preview_no]
-            progress = st.progress(0, text="Preparing page images…")
-            for n, pno in enumerate(target_pages):
-                try:
-                    image = render_page(doc, pno, scale=1.65)
-                    text_result, words = ocr_page(image, lang_code(language))
-                    st.session_state["ocr_text"][pno] = text_result
-                    st.session_state["ocr_words"][pno] = words
-                    progress.progress((n + 1) / len(target_pages), text=f"Recognised page {pno+1} of {page_count}")
-                except Exception as exc:
-                    st.error(f"OCR failed on page {pno+1}: {exc}")
-                    break
-            st.session_state["ocr_language"] = language
-            st.session_state["ocr_complete"] = True
-            progress.empty()
+        if error := st.session_state.pop("load_error", None):
+            st.error(error)
+        uploaded = st.file_uploader(
+            f"Choose a PDF (up to {P.MAX_BYTES // 1_048_576} MB and {P.MAX_PAGES} pages)",
+            type=["pdf"], key=f"upload_{st.session_state.get('uploads', 0)}",
+        )
+        if uploaded is not None:
+            load_document(uploaded.name, uploaded.getvalue())
+            if "load_error" in st.session_state:
+                # A fresh uploader, so the rejected file is not offered again.
+                st.session_state["uploads"] = st.session_state.get("uploads", 0) + 1
             st.rerun()
-        st.markdown('<div class="section-kicker">Recognised text / editable</div>', unsafe_allow_html=True)
-        if preview_no in st.session_state["ocr_text"]:
-            corrected = st.text_area(
-                "Correct OCR mistakes here",
-                value=st.session_state["ocr_text"][preview_no],
-                height=330,
-                key=f"edited_text_{preview_no}",
-                label_visibility="collapsed",
-                placeholder="Recognised text will appear here…",
-            )
-            st.session_state["ocr_text"][preview_no] = corrected
-            st.caption(f"{len(corrected)} characters · Page {preview_no+1}")
-            if st.button("Save correction for this page", key=f"save_{preview_no}"):
-                st.success("Correction saved for this session.")
-        else:
-            st.text_area("Recognised text", value="", height=330, disabled=True, label_visibility="collapsed", placeholder="Run OCR to populate editable text for this page.")
-    st.markdown('<div class="note">Recognition quality depends on scan clarity, typeface, skew and language data. Always review important names, numbers and legal/financial content before using the output.</div>', unsafe_allow_html=True)
-
-with tab_edit:
-    st.markdown('<div class="section-kicker">Page workshop / straightforward PDF edits</div>', unsafe_allow_html=True)
-    e1, e2 = st.columns([1, 1], gap="large")
-    with e1:
-        st.markdown('<div class="paper-card"><strong>Rotate pages</strong><p class="small-mono">Choose a page and rotate it by 90° clockwise.</p></div>', unsafe_allow_html=True)
-        rotate_page_label = st.selectbox("Page to rotate", [f"Page {i+1}" for i in range(page_count)], key="rotate_page")
-        rotate_degrees = st.selectbox("Rotation", ["90° clockwise", "180°", "270° clockwise"], key="rotation_value")
-        if st.button("Apply rotation", use_container_width=True):
-            pno = int(rotate_page_label.split()[-1]) - 1
-            delta = {"90° clockwise": 90, "180°": 180, "270° clockwise": 270}[rotate_degrees]
-            st.session_state["rotations"][pno] = (st.session_state["rotations"].get(pno, 0) + delta) % 360
-            st.success(f"Rotation queued for page {pno+1}.")
-    with e2:
-        st.markdown('<div class="paper-card"><strong>Remove a page</strong><p class="small-mono">Deleted pages are excluded from the exported PDF.</p></div>', unsafe_allow_html=True)
-        delete_label = st.selectbox("Page to remove", [f"Page {i+1}" for i in range(page_count)], key="delete_page")
-        if st.button("Mark page for removal", use_container_width=True):
-            pno = int(delete_label.split()[-1]) - 1
-            st.session_state["deleted_pages"].add(pno)
-            st.success(f"Page {pno+1} marked for removal.")
-        if st.session_state["deleted_pages"]:
-            st.caption("Marked for removal: " + ", ".join(str(x+1) for x in sorted(st.session_state["deleted_pages"])))
-            if st.button("Undo all page removals"):
-                st.session_state["deleted_pages"] = set()
-                st.rerun()
-    st.markdown('<div class="section-kicker">Add a text note</div>', unsafe_allow_html=True)
-    t1, t2 = st.columns([0.55, 1.45])
-    with t1:
-        add_page_label = st.selectbox("Place note on", [f"Page {i+1}" for i in range(page_count)], key="add_text_page")
-        note_size = st.slider("Text size", 8, 28, 12)
-    with t2:
-        note_text = st.text_input("Text to add", placeholder="e.g. Reviewed copy · 25 Nov 2026")
-    if st.button("Add note to page"):
-        pno = int(add_page_label.split()[-1]) - 1
-        st.session_state["added_text"][pno] = {"text": note_text, "size": note_size}
-        st.success(f"Text note queued for page {pno+1}.")
-    if st.session_state["rotations"] or st.session_state["deleted_pages"] or st.session_state["added_text"]:
-        st.info(
-            f"Pending edits · {len(st.session_state['rotations'])} rotated · "
-            f"{len(st.session_state['deleted_pages'])} removed · {len(st.session_state['added_text'])} text notes"
+        st.markdown(
+            '<p class="fd-help">Your file is held in memory for this session and is gone when you close it. '
+            "This is a demo, so avoid confidential documents.</p>",
+            unsafe_allow_html=True,
         )
-    st.caption("This POC supports rotation, page removal and adding a simple text note. It does not yet provide arbitrary click-and-replace editing of existing PDF text.")
+        if not status["ok"]:
+            st.warning(f"Text recognition is unavailable: {status['detail']} You can still rotate, remove and annotate pages.")
+    with right:
+        if SAMPLE.exists():
+            sample = SAMPLE.read_bytes()
+            st.image(page_image("sample", 0, 80, 0, sample), use_container_width=True)
+            st.markdown(
+                '<p class="fd-cap">No scan to hand? The sample is a two-page housing society notice in English '
+                "and Hindi, with one page scanned sideways.</p>",
+                unsafe_allow_html=True,
+            )
+            if st.button("Open the sample scan", use_container_width=True):
+                load_document(SAMPLE.name, sample)
+                st.rerun()
 
-with tab_export:
-    st.markdown('<div class="section-kicker">Export bench / prepare your files</div>', unsafe_allow_html=True)
-    st.markdown("Choose an output. Page edits are applied to the exported PDF; OCR text corrections are included in the searchable PDF.")
-    out_name = safe_filename(uploaded.name)
-    text_parts = []
-    for pno in range(page_count):
-        if pno in st.session_state["ocr_text"]:
-            text_parts.append(f"--- PAGE {pno+1} ---\n{st.session_state['ocr_text'][pno]}")
-    if text_parts:
-        st.download_button("Download recognised text (.txt)", "\n\n".join(text_parts).encode("utf-8"), file_name=f"{out_name}-ocr.txt", mime="text/plain", use_container_width=True)
-    else:
-        st.button("Download recognised text (.txt)", disabled=True, use_container_width=True)
-        st.caption("Run OCR on at least one page to enable the text download.")
 
-    def build_edited_pdf(include_ocr: bool = False) -> bytes:
-        out = fitz.open(stream=pdf_bytes, filetype="pdf")
-        # Apply rotation and notes before removing pages, preserving original page indexes.
-        for pno, rotation in st.session_state["rotations"].items():
-            if pno < len(out):
-                out[pno].set_rotation(rotation)
-        for pno, note in st.session_state["added_text"].items():
-            if pno < len(out) and note["text"].strip():
-                page = out[pno]
-                page.insert_text(
-                    fitz.Point(36, 36 + int(note["size"])),
-                    note["text"], fontsize=int(note["size"]), color=(0.25, 0.20, 0.42),
-                    fontname="helv", overlay=True,
-                )
-        for pno in sorted(st.session_state["deleted_pages"], reverse=True):
-            if 0 <= pno < len(out) and len(out) > 1:
-                out.delete_page(pno)
-        if include_ocr and st.session_state["ocr_text"]:
-            # Add corrected text layers using original page numbering; map around deleted pages.
-            remaining_original = [i for i in range(page_count) if i not in st.session_state["deleted_pages"]]
-            for new_idx, original_idx in enumerate(remaining_original):
-                if new_idx < len(out) and original_idx in st.session_state["ocr_text"]:
-                    text = st.session_state["ocr_text"][original_idx]
-                    if text.strip():
-                        page = out[new_idx]
-                        fontfile = None
-                        if "Hindi" in st.session_state.get("ocr_language", ""):
-                            for candidate in (
-                                "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-                                "/usr/share/fonts/truetype/noto/NotoSansDevanagariUI-Regular.ttf",
-                            ):
-                                if os.path.exists(candidate):
-                                    fontfile = candidate
-                                    break
-                        if not fontfile and os.path.exists("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
-                            fontfile = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-                        try:
-                            page.insert_textbox(
-                                fitz.Rect(8, 8, page.rect.width-8, page.rect.height-8),
-                                text, fontfile=fontfile, fontsize=7, render_mode=3,
-                                lineheight=1.15, overlay=True,
-                            )
-                        except Exception:
-                            pass
-        return out.tobytes(garbage=4, deflate=True)
+# --------------------------------------------------------------------------
+# Workspace
+# --------------------------------------------------------------------------
 
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        try:
-            edited_bytes = build_edited_pdf(False)
-            st.download_button("Download edited PDF", edited_bytes, file_name=f"{out_name}-edited.pdf", mime="application/pdf", use_container_width=True)
-        except Exception as exc:
-            st.error(f"Could not prepare edited PDF: {exc}")
-    with c2:
-        if st.session_state["ocr_text"]:
-            try:
-                searchable_bytes = build_edited_pdf(True)
-                st.download_button("Download searchable PDF", searchable_bytes, file_name=f"{out_name}-searchable.pdf", mime="application/pdf", use_container_width=True)
-            except Exception as exc:
-                st.error(f"Could not prepare searchable PDF: {exc}")
+def top_bar() -> None:
+    s = st.session_state
+    done = len(s["results"])
+    meta = f"{plural(s['page_count'], 'page')}, {len(s['pdf_bytes']) / 1024:.0f} KB"
+    if done:
+        meta += f", {done} read"
+    bar, action = st.columns([5, 1], vertical_alignment="bottom")
+    with bar:
+        st.markdown(
+            f'<div class="fd-top" style="margin-bottom:0;border-bottom:0;padding-bottom:0">'
+            f'<span class="fd-brand">FolioDesk</span>'
+            f'<span class="fd-file">{html.escape(s["filename"])}</span>'
+            f'<span class="fd-meta">{meta}</span></div>',
+            unsafe_allow_html=True,
+        )
+    with action:
+        st.button("Close file", on_click=close_document, use_container_width=True)
+    st.markdown('<div class="fd-top" style="padding:0;margin:6px 0 10px"></div>', unsafe_allow_html=True)
+    for notice in s["notices"]:
+        st.toast(notice)
+    s["notices"] = []
+
+
+def run_recognition(pages: list[int], language: str, detail: str, straighten: bool, use_embedded: bool) -> None:
+    s = st.session_state
+    total = len(pages)
+    bar = st.progress(0.0, text=f"Reading {plural(total, 'page')}…")
+    finished = 0
+
+    def on_done(page_no, result, exc):
+        nonlocal finished
+        finished += 1
+        bar.progress(finished / total, text=f"Read page {page_no + 1} ({finished} of {total})")
+
+    before = dict(s["rotations"])
+    results, errors = P.recognise_pages(
+        s["pdf_bytes"], pages, P.LANGUAGES[language], P.QUALITY_DPI[detail],
+        rotations=before, use_embedded=use_embedded, auto_rotate=straighten, on_done=on_done,
+    )
+    bar.empty()
+    turned = []
+    for page_no, result in results.items():
+        s["results"][page_no] = result
+        set_text(page_no, result["text"])
+        if result["rotation"] != before.get(page_no, 0):
+            s["rotations"][page_no] = result["rotation"]
+            turned.append(page_no + 1)
+    if turned:
+        s["notices"].append("Turned upright: page " + ", ".join(map(str, sorted(turned))))
+    for page_no, message in sorted(errors.items()):
+        s["notices"].append(f"Page {page_no + 1} could not be read. {message}")
+    if results and not errors:
+        seconds = sum(r["seconds"] for r in results.values())
+        s["notices"].append(f"Read {plural(len(results), 'page')} in {seconds:.1f} s of processing")
+
+
+def read_tab() -> None:
+    s = st.session_state
+    status = engine()
+    count = s["page_count"]
+    languages = P.available_languages(status["langs"])
+    can_read = status["ok"] and bool(languages)
+
+    if not can_read:
+        st.warning(
+            "Text recognition is unavailable here. "
+            + (status["detail"] if not status["ok"] else "No supported Tesseract language data is installed.")
+        )
+
+    c_lang, c_detail, c_opts, c_all, c_one = st.columns([1.5, 1.2, 1, 1.5, 1.2], vertical_alignment="bottom")
+    with c_lang:
+        language = st.selectbox("Language of the document", languages or ["English"], disabled=not can_read)
+    with c_detail:
+        detail = st.selectbox(
+            "Scan detail", list(P.QUALITY_DPI), index=1, disabled=not can_read,
+            help="Fast suits clean, large print. Fine print reads small or faint text more carefully and takes longer.",
+        )
+    with c_opts:
+        with st.popover("Options", use_container_width=True):
+            straighten = st.toggle(
+                "Turn sideways pages upright", value="osd" in status["langs"], disabled="osd" not in status["langs"],
+                help="Checks each page's orientation before reading it.",
+            )
+            use_embedded = st.toggle(
+                "Reuse text the PDF already has", value=True,
+                help="Pages that already contain real text are copied exactly instead of being recognised from the image.",
+            )
+            show_marks = st.toggle("Mark uncertain words on the page", value=True)
+
+    if s["current"] >= count:
+        s["current"] = 0
+
+    def page_label(p: int) -> str:
+        suffix = " (removed)" if p in s["removed"] else " ✓" if p in s["results"] else ""
+        return f"{p + 1}{suffix}"
+
+    todo = [p for p in range(count) if p not in s["removed"] and not is_edited(p)]
+    with c_all:
+        read_all = st.button("Read all pages", type="primary", use_container_width=True, disabled=not (can_read and todo))
+    with c_one:
+        read_one = st.button("Read this page", use_container_width=True, disabled=not can_read)
+
+    if count > 1:
+        picked = st.segmented_control(
+            "Page", list(range(count)), format_func=page_label, default=s["current"], key="page_pick",
+        )
+        if picked is not None:
+            s["current"] = picked
+    page_no = s["current"]
+
+    if read_all or read_one:
+        kept = [p + 1 for p in range(count) if read_all and is_edited(p) and p not in s["removed"]]
+        run_recognition(todo if read_all else [page_no], language, detail, straighten, use_embedded)
+        if kept:
+            s["notices"].append("Kept your corrections on page " + ", ".join(map(str, kept)))
+        st.rerun()
+
+    result = s["results"].get(page_no)
+    rotation = s["rotations"].get(page_no, 0)
+    left, right = st.columns([0.9, 1.1], gap="large")
+    with left:
+        image = page_image(s["file_key"], page_no, PREVIEW_DPI, rotation, s["pdf_bytes"])
+        if result and show_marks and not is_stale(page_no) and result["low_count"] > 0:
+            image = P.highlight_words(image, result["size"], result["words"])
+        st.image(image, use_container_width=True)
+    with right:
+        if result is None:
+            st.markdown(
+                '<div class="fd-status">This page has not been read yet. Choose the language, then '
+                "<b>Read all pages</b>.</div>",
+                unsafe_allow_html=True,
+            )
+            st.text_area("Text on this page", "", height=460, disabled=True,
+                         placeholder="The page's text appears here, ready to correct.")
+            return
+        if is_stale(page_no):
+            st.markdown(
+                '<div class="fd-status warn">This page was rotated after it was read. Read it again so the '
+                "searchable text lines up with the page.</div>",
+                unsafe_allow_html=True,
+            )
+        elif result["source"] == "embedded":
+            st.markdown(
+                '<div class="fd-status">This page already contained text, so it was copied exactly rather than '
+                "recognised from the image.</div>",
+                unsafe_allow_html=True,
+            )
+        elif not result["words"]:
+            st.markdown('<div class="fd-status warn">No text was found on this page.</div>', unsafe_allow_html=True)
         else:
-            st.button("Download searchable PDF", disabled=True, use_container_width=True)
-            st.caption("Recognise at least one page first.")
+            low = result["low_count"]
+            review = (
+                f"<mark>{plural(low, 'word')}</mark> marked on the page for a second look."
+                if low else "No words needed marking."
+            )
+            st.markdown(
+                f'<div class="fd-status">Read with {result["confidence"]:.0f}% average confidence. {review}</div>',
+                unsafe_allow_html=True,
+            )
+        key = f"text_{page_no}"
+        if key not in s:
+            s[key] = s["texts"].get(page_no, result["text"])
+        st.text_area("Text on this page", key=key, height=460, on_change=keep_edit, args=(page_no,),
+                     help="Corrections you make here go into the text file and the searchable PDF.")
+        text = s["texts"].get(page_no, "")
+        info, undo = st.columns([2, 1], vertical_alignment="center")
+        with info:
+            st.markdown(
+                f'<p class="fd-cap">{plural(len(text.split()), "word")}'
+                f'{", corrected by you" if is_edited(page_no) else ""}</p>',
+                unsafe_allow_html=True,
+            )
+        with undo:
+            if is_edited(page_no):
+                st.button("Undo my corrections", on_click=set_text, args=(page_no, result["text"]),
+                          use_container_width=True)
 
-    st.markdown('<div class="note">The searchable PDF keeps the original page artwork and adds an invisible text layer. On this POC, corrected text is placed as a page-level text layer; complex layouts may not align perfectly with the original scan.</div>', unsafe_allow_html=True)
 
-doc.close()
-st.markdown('<div class="footerline">Foliodesk · CPU OCR · Hindi / English starter build · Review output before production use</div>', unsafe_allow_html=True)
+def pages_tab() -> None:
+    s = st.session_state
+    count = s["page_count"]
+    st.markdown(
+        '<p class="fd-help">Turn pages the right way up and drop the ones you do not need. '
+        "Nothing changes in your original file; the edits apply to what you export.</p>",
+        unsafe_allow_html=True,
+    )
+    kept = count - len(s["removed"])
+    per_row = 5
+    for start in range(0, count, per_row):
+        cols = st.columns(per_row, gap="medium")
+        for col, page_no in zip(cols, range(start, min(start + per_row, count))):
+            with col:
+                rotation = s["rotations"].get(page_no, 0)
+                gone = page_no in s["removed"]
+                thumb = page_image(s["file_key"], page_no, THUMB_DPI, rotation, s["pdf_bytes"])
+                st.image(P.dim_image(thumb) if gone else thumb, use_container_width=True)
+                if gone:
+                    st.markdown(f'<p class="fd-cap removed">Page {page_no + 1}, removed</p>', unsafe_allow_html=True)
+                else:
+                    turned = f", turned {rotation}°" if rotation else ""
+                    st.markdown(f'<p class="fd-cap">Page {page_no + 1}{turned}</p>', unsafe_allow_html=True)
+                b1, b2, b3 = st.columns([1, 1, 2])
+                b1.button(":material/rotate_left:", key=f"l{page_no}", help="Turn left", disabled=gone,
+                          on_click=rotate, args=(page_no, 270), use_container_width=True)
+                b2.button(":material/rotate_right:", key=f"r{page_no}", help="Turn right", disabled=gone,
+                          on_click=rotate, args=(page_no, 90), use_container_width=True)
+                b3.button("Restore" if gone else "Remove", key=f"x{page_no}", on_click=toggle_removed,
+                          args=(page_no,), use_container_width=True, disabled=not gone and kept <= 1,
+                          help="The last remaining page cannot be removed." if not gone and kept <= 1 else None)
+
+    st.markdown('<h2 class="fd-h2" style="margin-top:26px">Stamp a note on a page</h2>'
+                '<p class="fd-help">A short visible line such as “Reviewed copy” or a reference number. '
+                "Hindi works too.</p>", unsafe_allow_html=True)
+    with st.form("note", clear_on_submit=True, border=False):
+        n_text, n_page, n_pos, n_size, n_add = st.columns([3, 1, 1.4, 1, 1.1], vertical_alignment="bottom")
+        text = n_text.text_input("Note", placeholder="Reviewed copy, 25 Nov 2026", max_chars=120)
+        target = n_page.selectbox("Page", list(range(count)), format_func=lambda p: str(p + 1))
+        position = n_pos.selectbox("Corner", P.NOTE_POSITIONS)
+        size = n_size.number_input("Size", 8, 28, 12)
+        if n_add.form_submit_button("Add note", use_container_width=True):
+            if text.strip():
+                s["notes"].append({"page": target, "text": text.strip(), "position": position, "size": int(size)})
+            else:
+                st.warning("Type the note's text first.")
+    for i, note in enumerate(s["notes"]):
+        line, drop = st.columns([6, 1], vertical_alignment="center")
+        line.markdown(
+            f'<div class="fd-status" style="margin:0">Page {note["page"] + 1}, {note["position"].lower()}: '
+            f'{html.escape(note["text"])}</div>', unsafe_allow_html=True)
+        if drop.button("Delete", key=f"note_{i}", use_container_width=True):
+            s["notes"].pop(i)
+            st.rerun()
+
+
+def export_tab() -> None:
+    s = st.session_state
+    count = s["page_count"]
+    kept = [p for p in range(count) if p not in s["removed"]]
+    layer_pages = [p for p in kept if p in s["results"] and s["results"][p]["source"] == "ocr" and not is_stale(p)]
+    stale = [p + 1 for p in kept if is_stale(p)]
+    unread = [p + 1 for p in kept if p not in s["results"]]
+    name = P.safe_filename(s["filename"])
+
+    left, right = st.columns([1.1, 0.9], gap="large")
+    with left:
+        st.markdown('<h2 class="fd-h2">What your PDF will contain</h2>', unsafe_allow_html=True)
+        turned = sum(1 for p in kept if s["rotations"].get(p, 0))
+        noted = sum(1 for n in s["notes"] if n["page"] in kept)
+        items = [f"{plural(len(kept), 'page')}" + (f" ({len(s['removed'])} removed)" if s["removed"] else "")]
+        if turned:
+            items.append(f"{plural(turned, 'page')} turned")
+        if noted:
+            items.append(f"{plural(noted, 'note')} stamped")
+        if layer_pages:
+            items.append(f"Searchable text on {plural(len(layer_pages), 'page')}, including your corrections")
+        st.markdown('<ul class="fd-list">' + "".join(f"<li>{i}</li>" for i in items) + "</ul>", unsafe_allow_html=True)
+        if unread and engine()["ok"]:
+            st.markdown(
+                f'<div class="fd-status warn" style="margin-top:12px">Not read yet: page {", ".join(map(str, unread))}. '
+                "Those pages will not be searchable.</div>", unsafe_allow_html=True)
+        if stale:
+            st.markdown(
+                f'<div class="fd-status warn" style="margin-top:12px">Rotated since reading: page '
+                f'{", ".join(map(str, stale))}. Read them again to make them searchable.</div>',
+                unsafe_allow_html=True)
+    with right:
+        st.markdown('<h2 class="fd-h2">Download</h2>', unsafe_allow_html=True)
+        try:
+            pdf, report = export_pdf(
+                s["file_key"], dict(s["rotations"]), tuple(sorted(s["removed"])), list(s["notes"]),
+                {p: s["results"][p] for p in layer_pages}, {p: s["texts"][p] for p in layer_pages if p in s["texts"]},
+                bool(layer_pages), s["pdf_bytes"],
+            )
+        except Exception as exc:  # noqa: BLE001 - shown to the user
+            st.error(f"The PDF could not be prepared. {exc}")
+        else:
+            label = "Download searchable PDF" if layer_pages else "Download PDF"
+            st.download_button(label, pdf, file_name=f"{name}-{'searchable' if layer_pages else 'edited'}.pdf",
+                               mime="application/pdf", type="primary", use_container_width=True)
+            size = f"{len(pdf) / 1024:.0f} KB."
+            st.markdown(
+                f'<p class="fd-cap">{size} The page images are untouched; the text sits invisibly on top of them.</p>'
+                if layer_pages else
+                f'<p class="fd-cap">{size} Read the pages to make this PDF searchable.</p>',
+                unsafe_allow_html=True)
+            loose = [p + 1 for p, mode in report["layers"].items() if mode == "page"]
+            if loose:
+                st.markdown(
+                    f'<div class="fd-status">On page {", ".join(map(str, sorted(loose)))} your corrections changed '
+                    "the number of lines, so the text is searchable but will not line up exactly with the scan.</div>",
+                    unsafe_allow_html=True)
+        text = P.build_text(count, s["texts"], s["removed"])
+        st.download_button("Download text (.txt)", text.encode("utf-8"), file_name=f"{name}.txt", mime="text/plain",
+                           use_container_width=True, disabled=not text)
+    st.markdown(
+        '<p class="fd-help" style="margin-top:22px">Recognition is never perfect. Check names, amounts and dates '
+        "against the page before relying on the text.</p>", unsafe_allow_html=True)
+
+
+# --------------------------------------------------------------------------
+
+if "pdf_bytes" not in st.session_state:
+    landing()
+else:
+    top_bar()
+    tab_read, tab_pages, tab_export = st.tabs(["Read and correct", "Arrange pages", "Export"])
+    with tab_read:
+        read_tab()
+    with tab_pages:
+        pages_tab()
+    with tab_export:
+        export_tab()

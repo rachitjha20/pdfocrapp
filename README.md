@@ -4,16 +4,27 @@ A CPU-based, single-service Streamlit proof of concept for scanned PDFs.
 
 ## Included
 
-- PDF upload and validation (10 MB / 10 pages)
-- Page preview
-- Tesseract OCR on CPU, page-by-page
-- Hindi, English and Hindi + English selection
-- French, German and Spanish selectors (requires corresponding Tesseract language data on the host)
-- Editable OCR text by page
+- PDF upload and validation (10 MB / 10 pages), plus a bundled sample scan to try
+- Tesseract OCR on CPU, pages read in parallel
+- Sideways pages detected and turned upright before reading
+- Pages that already contain real text are copied exactly instead of being re-recognised
+- Words the engine was unsure about are highlighted on the page preview
+- Editable text per page; corrections are kept when you re-read the other pages
+- Searchable PDF export: invisible text placed word by word over the scan, so search hits and selections line up with the image (line by line once a page has been corrected)
+- Page tools with live thumbnails: rotate, remove/restore, stamp a short note (English or Hindi)
 - TXT export
-- Searchable PDF export with an invisible text layer
-- Basic PDF operations: rotate page, remove page, add a simple text note
+- Language list shows only the Tesseract language packs actually installed
 - No database, login, payment gateway, external AI API or permanent file storage
+
+## Code layout
+
+- `app.py`: the Streamlit interface only
+- `processing.py`: validation, rendering, OCR and PDF export; no Streamlit imports, so it can be reused or tested alone
+- `tests/test_processing.py`: end-to-end checks against `samples/sample-scan.pdf` (`pip install pytest && pytest`)
+- `make_sample.py`: regenerates the sample scan
+- `.streamlit/config.toml`: theme and the 10 MB upload cap
+
+`OCR_WORKERS` sets how many pages are read at once (default: up to 2). `render.yaml` sets it to 1 for small instances.
 
 ## Local setup
 
@@ -23,7 +34,7 @@ Requirements: Python 3.11 and the Tesseract executable with English/Hindi langua
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin fonts-noto-core fonts-dejavu-core
+sudo apt-get install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin tesseract-ocr-osd fonts-noto-core fonts-dejavu-core
 ```
 
 ### Windows
@@ -74,8 +85,9 @@ Do not rely on a self-ping process inside the same sleeping service: once the se
 - CPU-only OCR; speed depends on scan quality, page dimensions and Render CPU allocation.
 - Hindi/English language data are installed by `apt.txt`. French/German/Spanish choices need `tesseract-ocr-fra`, `tesseract-ocr-deu`, or `tesseract-ocr-spa` added to `apt.txt`.
 - OCR is not guaranteed to be accurate. Review important content.
-- Searchable PDF export adds a page-level invisible text layer. It does not reconstruct the original text layout or provide true in-place editing of existing PDF text.
-- The PDF editor is intentionally limited to rotation, page deletion and adding a simple text note.
+- The searchable text layer is for search and copy. Hindi text is stored without complex-script shaping, and if a correction changes the number of lines on a page, that page's text is searchable but no longer lined up with the scan.
+- "Hindi + English" runs Tesseract as `eng+hin`: with Hindi first, the digit 1 is dropped from Latin text.
+- Page tools are intentionally limited to rotation, page removal and a short stamped note.
 - Uploaded documents are processed in memory. Render's filesystem is ephemeral, but do not upload confidential documents to a public demo without an appropriate privacy review.
 - This is a demonstration build, not a production multi-user service. It has no authentication, quotas, malware scanning, job queue or durable storage.
 

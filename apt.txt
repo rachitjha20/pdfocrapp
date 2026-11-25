@@ -1,5 +1,6 @@
 tesseract-ocr
 tesseract-ocr-eng
 tesseract-ocr-hin
+tesseract-ocr-osd
 fonts-noto-core
 fonts-dejavu-core
