@@ -51,20 +51,27 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy to Render
+## Run with Docker
 
-1. Push this folder to a GitHub repository.
-2. In Render, create **New → Web Service** and connect the repository.
-3. Runtime: Python 3.
-4. Build command: `pip install -r requirements.txt`
-5. Start command:
+The image includes Tesseract, the English, Hindi and orientation data, and the fonts, so nothing else needs installing:
 
 ```bash
-streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
+docker build -t foliodesk .
+docker run --rm -p 8501:10000 foliodesk
 ```
 
-6. Select the Free instance for a short demo if available. Render detects `apt.txt` and installs the Tesseract packages during build.
-7. The Streamlit health endpoint is `/_stcore/health`.
+Then open http://localhost:8501.
+
+## Deploy to Render
+
+Render's native Python runtime cannot install Tesseract (it ignores `apt.txt`), so the app deploys as a Docker service.
+
+1. Push this folder to a GitHub repository.
+2. In Render, create **New → Web Service**, connect the repository and choose **Docker** as the language. Render finds the `Dockerfile` and needs no build or start command. (Or use **New → Blueprint**, which reads `render.yaml`.)
+3. Select the Free instance for a short demo if available.
+4. The Streamlit health endpoint is `/_stcore/health`.
+
+An existing service created with the Python runtime cannot be switched to Docker: create a new service and delete the old one. If the app says "Text recognition is unavailable", it is running without Tesseract, which means it was not built from the Dockerfile.
 
 ## Today's demo / keep-awake helper
 
@@ -83,7 +90,7 @@ Do not rely on a self-ping process inside the same sleeping service: once the se
 ## Limitations to know
 
 - CPU-only OCR; speed depends on scan quality, page dimensions and Render CPU allocation.
-- Hindi/English language data are installed by `apt.txt`. French/German/Spanish choices need `tesseract-ocr-fra`, `tesseract-ocr-deu`, or `tesseract-ocr-spa` added to `apt.txt`.
+- Hindi/English language data are installed by the `Dockerfile`. French, German and Spanish appear in the language list once `tesseract-ocr-fra`, `tesseract-ocr-deu` or `tesseract-ocr-spa` is added to its `apt-get install` line.
 - OCR is not guaranteed to be accurate. Review important content.
 - The searchable text layer is for search and copy. Hindi text is stored without complex-script shaping, and if a correction changes the number of lines on a page, that page's text is searchable but no longer lined up with the scan.
 - "Hindi + English" runs Tesseract as `eng+hin`: with Hindi first, the digit 1 is dropped from Latin text.
