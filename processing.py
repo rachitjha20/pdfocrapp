@@ -8,11 +8,14 @@ the origin at the top-left. Export converts back to the PDF's unrotated space.
 """
 from __future__ import annotations
 
+import io
+import math
 import os
 import re
 import shutil
 import subprocess
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Any, Callable, Iterable
@@ -63,6 +66,10 @@ _FONT_CANDIDATES = {
 
 class PdfError(ValueError):
     """A problem with the uploaded file that the user can act on."""
+
+
+class PdfLocked(PdfError):
+    """The PDF needs a password before it can be opened."""
 
 
 # --------------------------------------------------------------------------
@@ -117,7 +124,7 @@ def inspect_pdf(pdf_bytes: bytes) -> int:
         raise PdfError("This file could not be opened as a PDF. Check that it is not damaged.") from exc
     with doc:
         if doc.needs_pass:
-            raise PdfError("This PDF is password-protected. Remove the password and upload it again.")
+            raise PdfLocked("This PDF is password-protected. Enter its password to open it.")
         count = len(doc)
     if count == 0:
         raise PdfError("This PDF has no pages.")
@@ -128,6 +135,31 @@ def inspect_pdf(pdf_bytes: bytes) -> int:
     return count
 
 
+def unlock_pdf(pdf_bytes: bytes, password: str) -> bytes:
+    """Return an unprotected copy of a password-protected PDF."""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:  # noqa: BLE001
+        raise PdfError("This file could not be opened as a PDF. Check that it is not damaged.") from exc
+    with doc:
+        if doc.needs_pass and not doc.authenticate(password):
+            raise PdfLocked("That password did not open the file. Check it and try again.")
+        return doc.tobytes(encryption=fitz.PDF_ENCRYPT_NONE, garbage=3, deflate=True)
+
+
+def merge_pdfs(base: bytes, extra: bytes) -> tuple[bytes, int]:
+    """Append the pages of `extra` to `base`. Returns the new PDF and how many pages were added."""
+    added = inspect_pdf(extra)
+    doc = fitz.open(stream=base, filetype="pdf")
+    with doc, fitz.open(stream=extra, filetype="pdf") as other:
+        if len(doc) + added > MAX_PAGES:
+            raise PdfError(
+                f"Adding {added} pages would make {len(doc) + added}. The limit is {MAX_PAGES} pages."
+            )
+        doc.insert_pdf(other)
+        return doc.tobytes(garbage=3, deflate=True), added
+
+
 def _open_page(pdf_bytes: bytes, page_no: int, extra_rotation: int) -> tuple[fitz.Document, fitz.Page]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[page_no]
@@ -136,9 +168,15 @@ def _open_page(pdf_bytes: bytes, page_no: int, extra_rotation: int) -> tuple[fit
     return doc, page
 
 
-def render_page(pdf_bytes: bytes, page_no: int, dpi: int = 110, extra_rotation: int = 0) -> Image.Image:
-    """Render one page as it will look after `extra_rotation` is applied."""
-    doc, page = _open_page(pdf_bytes, page_no, extra_rotation)
+def render_page(pdf_bytes: bytes, page_no: int, dpi: int = 110, extra_rotation: int = 0,
+                edits: list[dict[str, Any]] | None = None) -> Image.Image:
+    """Render one page as it will look after `extra_rotation` and any `edits` are applied."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_no]
+    base = page.rotation
+    if edits:
+        apply_edits(page, edits, base)
+    page.set_rotation((base + extra_rotation) % 360)
     with doc:
         scale = dpi / 72
         area = page.rect.width * page.rect.height * scale * scale
@@ -355,28 +393,38 @@ def _font_for(text: str) -> fitz.Font:
     return _font("latin")
 
 
-def _write(page: fitz.Page, writer: fitz.TextWriter, **kwargs: Any) -> None:
+def _write(page: fitz.Page, writer: fitz.TextWriter, turn: tuple[fitz.Point, float] | None = None,
+           **kwargs: Any) -> None:
     """Write display-space text onto the page, whatever its rotation.
 
     `writer` must have been created with `page.rect`. PyMuPDF places TextWriter
     output in the page's unrotated space, so on a rotated page the text is
     carried there with the page's derotation matrix (expressed in PDF's
     bottom-left coordinates, and undoing the shift write_text adds itself).
+    `turn` optionally rotates the text by an angle about a display-space point.
     """
-    if page.rotation == 0:
+    matrix = fitz.Matrix(1, 1)
+    if turn:
+        pivot = turn[0] * writer.ictm
+        shift = fitz.Matrix(1, 1).pretranslate(pivot.x, pivot.y)
+        matrix = ~shift * fitz.Matrix(turn[1]) * shift
+    if page.rotation:
+        unrotated_height = page.cropbox.height
+        matrix = (
+            matrix
+            * writer.ictm
+            * page.derotation_matrix
+            * fitz.Matrix(1, 0, 0, -1, 0, unrotated_height)
+            * fitz.Matrix(1, 0, 0, 1, 0, page.rect.height - unrotated_height)
+        )
+    if turn or page.rotation:
+        writer.write_text(page, matrix=matrix, overlay=True, **kwargs)
+    else:
         writer.write_text(page, overlay=True, **kwargs)
-        return
-    unrotated_height = page.cropbox.height
-    matrix = (
-        writer.ictm
-        * page.derotation_matrix
-        * fitz.Matrix(1, 0, 0, -1, 0, unrotated_height)
-        * fitz.Matrix(1, 0, 0, 1, 0, page.rect.height - unrotated_height)
-    )
-    writer.write_text(page, matrix=matrix, overlay=True, **kwargs)
 
 
-def _fit(writer: fitz.TextWriter, text: str, x0: float, x1: float, baseline: float, height: float) -> None:
+def _fit(writer: fitz.TextWriter, text: str, x0: float, x1: float, baseline: float, height: float,
+         pad: str = " ") -> None:
     """Place `text` so it spans x0..x1, keeping selections aligned with the scan."""
     font = _font_for(text)
     unit = font.text_length(text, fontsize=1)
@@ -385,7 +433,7 @@ def _fit(writer: fitz.TextWriter, text: str, x0: float, x1: float, baseline: flo
     size = max(2.0, min((x1 - x0) / unit, height * 1.6))
     try:
         # The trailing space keeps neighbouring words separate when text is copied or searched.
-        writer.append(fitz.Point(x0, baseline), text + " ", font=font, fontsize=size)
+        writer.append(fitz.Point(x0, baseline), text + pad, font=font, fontsize=size)
     except Exception:  # noqa: BLE001 - a glyph the font lacks should not sink the export
         pass
 
@@ -439,52 +487,278 @@ def _add_note(page: fitz.Page, note: dict[str, Any]) -> None:
     _write(page, writer, color=(0.09, 0.18, 0.52))
 
 
+# -- Page edits ------------------------------------------------------------
+#
+# An edit is a dict in display space, valid for the rotation it was drawn at:
+#   {"kind": "text",      "rect": [x0, y0, x1, y1], "rotation": r, "text": str, "size": float, "color": "#rrggbb"}
+#   {"kind": "highlight", "rect": ..., "rotation": r, "color": "#rrggbb"}
+#   {"kind": "cover",     "rect": ..., "rotation": r, "color": "#rrggbb"}
+#   {"kind": "redact",    "rect": ..., "rotation": r}
+#   {"kind": "image",     "rect": ..., "rotation": r, "data": bytes}
+#   {"kind": "replace",   "rect": ..., "rotation": r, "text": str, "color": "#rrggbb", "fill": "#rrggbb"}
+
+EDIT_KINDS = ("text", "highlight", "cover", "redact", "image", "replace")
+
+
+def _rgb(color: str) -> tuple[float, float, float]:
+    color = color.lstrip("#")
+    return tuple(int(color[i:i + 2], 16) / 255 for i in (0, 2, 4))  # type: ignore[return-value]
+
+
+def _hex(rgb: Iterable[float]) -> str:
+    return "#" + "".join(f"{max(0, min(255, round(v))):02x}" for v in rgb)
+
+
+def apply_edits(page: fitz.Page, edits: list[dict[str, Any]], base_rotation: int) -> None:
+    """Draw edits onto a page. Each is applied at the rotation it was drawn at,
+    so it stays glued to the content if the page is turned afterwards.
+    Leaves the page's rotation changed; the caller sets the final one."""
+    for edit in edits:
+        page.set_rotation((base_rotation + edit.get("rotation", 0)) % 360)
+        display = fitz.Rect(edit["rect"]).normalize() & page.rect
+        if display.is_empty or display.width < 1 or display.height < 1:
+            continue
+        own = display * page.derotation_matrix  # the page's unrotated space
+        own.normalize()
+        kind = edit["kind"]
+        if kind == "highlight":
+            page.draw_rect(own, color=None, fill=_rgb(edit.get("color", "#ffd60a")), fill_opacity=0.4, overlay=True)
+        elif kind == "cover":
+            page.draw_rect(own, color=None, fill=_rgb(edit.get("color", "#ffffff")), overlay=True)
+        elif kind == "redact":
+            page.add_redact_annot(own, fill=(0, 0, 0))
+            page.apply_redactions()  # removes the text and image pixels underneath, not just hides them
+        elif kind == "image":
+            page.insert_image(own, stream=edit["data"], rotate=page.rotation, keep_proportion=True, overlay=True)
+        elif kind == "text":
+            _text_in_box(page, display, edit["text"], float(edit.get("size", 12)), edit.get("color", "#16202c"))
+        elif kind == "replace":
+            page.add_redact_annot(own, fill=_rgb(edit.get("fill", "#ffffff")))
+            page.apply_redactions()
+            text = edit.get("text", "").strip()
+            if text:
+                writer = fitz.TextWriter(page.rect)
+                _fit(writer, text, display.x0, display.x1, display.y1 - 0.2 * display.height,
+                     display.height / 1.6, pad="")
+                _write(page, writer, color=_rgb(edit.get("color", "#16202c")))
+
+
+def _text_in_box(page: fitz.Page, box: fitz.Rect, text: str, size: float, color: str) -> None:
+    """Wrap text inside a box, shrinking it if needed so that all of it fits."""
+    if not text.strip():
+        return
+    font = _font_for(text)
+    for attempt in (size, size * 0.85, size * 0.7, size * 0.55, size * 0.4, 4):
+        writer = fitz.TextWriter(page.rect)
+        try:
+            leftover = writer.fill_textbox(box, text, font=font, fontsize=attempt)
+        except Exception:  # noqa: BLE001 - box too small for one line at this size
+            leftover = [1]
+        if not leftover:
+            _write(page, writer, color=_rgb(color))
+            return
+    # Too small to wrap at any size: write one line from the box's top-left.
+    writer = fitz.TextWriter(page.rect)
+    writer.append(fitz.Point(box.x0, box.y0 + size), text.splitlines()[0], font=font, fontsize=size)
+    _write(page, writer, color=_rgb(color))
+
+
+def find_text(pdf_bytes: bytes, page_no: int, query: str, extra_rotation: int = 0,
+              result: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Find `query` on a page. Returns display-space boxes with the colours to
+    use when replacing: the paper colour around each match and the ink colour.
+
+    Looks in the PDF's own text first, then in the recognised words of a scan.
+    """
+    query = query.strip()
+    if not query:
+        return []
+    doc, page = _open_page(pdf_bytes, page_no, extra_rotation)
+    with doc:
+        boxes = [fitz.Rect(r) * page.rotation_matrix for r in page.search_for(query)]
+        for box in boxes:
+            box.normalize()
+        if not boxes and result and result.get("rotation", 0) == extra_rotation % 360:
+            boxes = _find_in_words(result["words"], query)
+        if not boxes:
+            return []
+        scale = 2.0
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+        image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    matches = []
+    for box in boxes:
+        grown = fitz.Rect(box.x0 - 1, box.y0 - 1.5, box.x1 + 1, box.y1 + 1.5) & fitz.Rect(0, 0, *[v / scale for v in image.size])
+        crop = image.crop(tuple(int(v * scale) for v in grown))
+        pixels = sorted(crop.getdata(), key=sum) if crop.width and crop.height else [(255, 255, 255)]
+        paper = pixels[int(len(pixels) * 0.85)]   # the lighter bulk is the background
+        ink = pixels[int(len(pixels) * 0.03)]     # the darkest few percent is the lettering
+        matches.append({"rect": list(grown), "fill": _hex(paper), "color": _hex(ink)})
+    return matches
+
+
+def _find_in_words(words: list[dict[str, Any]], query: str) -> list[fitz.Rect]:
+    """Match a phrase against consecutive recognised words, ignoring case."""
+    wanted = query.casefold().split()
+    found = []
+    for i in range(len(words) - len(wanted) + 1):
+        run = words[i:i + len(wanted)]
+        texts = [w["text"].casefold() for w in run]
+        if len(wanted) == 1:
+            hit = wanted[0] in texts[0]
+        else:
+            hit = (texts[0].endswith(wanted[0]) and texts[-1].startswith(wanted[-1])
+                   and texts[1:-1] == wanted[1:-1])
+        if hit and max(w["y0"] for w in run) < min(w["y1"] for w in run):  # same line
+            found.append(fitz.Rect(min(w["x0"] for w in run), min(w["y0"] for w in run),
+                                   max(w["x1"] for w in run), max(w["y1"] for w in run)))
+    return found
+
+
+def _add_watermark(page: fitz.Page, text: str) -> None:
+    font = _font_for(text)
+    width, height = page.rect.width, page.rect.height
+    diagonal = (width ** 2 + height ** 2) ** 0.5
+    size = min(96.0, 0.7 * diagonal / max(font.text_length(text, fontsize=1), 0.01))
+    length = font.text_length(text, fontsize=size)
+    centre = fitz.Point(width / 2, height / 2)
+    writer = fitz.TextWriter(page.rect)
+    writer.append(fitz.Point(centre.x - length / 2, centre.y + size * 0.35), text, font=font, fontsize=size)
+    angle = fitz.Point(width, height).unit
+    _write(page, writer, turn=(centre, math.degrees(math.atan2(angle.y, angle.x))),
+           color=(0.35, 0.38, 0.45), opacity=0.18)
+
+
+def _add_page_number(page: fitz.Page, number: int, total: int) -> None:
+    text = f"{number} / {total}"
+    font = _font("latin")
+    size = 9.0
+    writer = fitz.TextWriter(page.rect)
+    x = (page.rect.width - font.text_length(text, fontsize=size)) / 2
+    writer.append(fitz.Point(x, page.rect.height - 20), text, font=font, fontsize=size)
+    _write(page, writer, color=(0.3, 0.33, 0.4))
+
+
+def _shrink_images(doc: fitz.Document, max_dpi: int = 130, quality: int = 60) -> None:
+    """Re-encode large images as JPEG at a lower resolution. Biggest win on scans."""
+    seen: set[int] = set()
+    for page in doc:
+        for info in page.get_images(full=True):
+            xref, smask = info[0], info[1]
+            if xref in seen or smask:
+                continue
+            seen.add(xref)
+            try:
+                rects = page.get_image_rects(xref)
+                pix = fitz.Pixmap(doc, xref)
+                if pix.colorspace is None or pix.alpha or not rects:
+                    continue
+                if pix.colorspace.n > 3:
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                image = Image.frombytes("L" if pix.n == 1 else "RGB", (pix.width, pix.height), pix.samples)
+                shown = max(max(r.width, r.height) for r in rects) / 72  # inches on the page
+                limit = int(shown * max_dpi)
+                if max(image.size) > limit > 0:
+                    image.thumbnail((limit, limit), Image.LANCZOS)
+                out = io.BytesIO()
+                image.save(out, "JPEG", quality=quality, optimize=True)
+                if out.tell() < len(doc.xref_stream_raw(xref)) * 0.9:
+                    page.replace_image(xref, stream=out.getvalue())
+            except Exception:  # noqa: BLE001 - leave an image we cannot re-encode as it is
+                continue
+
+
 def build_pdf(pdf_bytes: bytes, rotations: dict[int, int] | None = None,
               removed: Iterable[int] = (), notes: list[dict[str, Any]] | None = None,
               results: dict[int, dict[str, Any]] | None = None,
               edited_text: dict[int, str] | None = None,
-              text_layer: bool = False) -> tuple[bytes, dict[str, Any]]:
-    """Apply page edits and, optionally, a searchable text layer.
+              text_layer: bool = False, *,
+              order: list[int] | None = None,
+              edits: dict[int, list[dict[str, Any]]] | None = None,
+              watermark: str = "", page_numbers: bool = False,
+              compress: bool = False, password: str = "") -> tuple[bytes, dict[str, Any]]:
+    """Apply everything the user asked for and return the finished PDF.
 
-    Returns the PDF and a small report: pages kept and how each text layer was aligned.
+    Pages are identified by their index in `pdf_bytes`; `order` lists them in
+    output order. Returns the PDF and a small report: pages kept, how each
+    text layer was aligned, and pages left unsearchable because of redactions.
     """
-    rotations, results, edited_text = rotations or {}, results or {}, edited_text or {}
+    rotations, results, edited_text, edits = rotations or {}, results or {}, edited_text or {}, edits or {}
     removed = set(removed)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    keep = [p for p in range(len(doc)) if p not in removed]
+    keep = [p for p in (order if order is not None else range(len(doc))) if p not in removed]
     if not keep:
         raise PdfError("Every page is marked as removed. Restore at least one page to export.")
     layers: dict[int, str] = {}
-    for page_no in keep:
+    withheld: list[int] = []
+    for position, page_no in enumerate(keep, start=1):
         page = doc[page_no]
+        base = page.rotation
         extra = rotations.get(page_no, 0) % 360
-        if extra:
-            page.set_rotation((page.rotation + extra) % 360)
+        page_edits = edits.get(page_no, [])
+        redacted = any(e["kind"] == "redact" for e in page_edits)
         result = results.get(page_no)
         # Pages that already carry text need no layer; stale results (page rotated
         # since it was recognised) would be misplaced, so they are skipped too.
-        if text_layer and result and result["source"] == "ocr" and result["rotation"] == extra:
+        wants_layer = bool(text_layer and result and result["source"] == "ocr" and result["rotation"] == extra)
+        if wants_layer and redacted:
+            # A hidden text layer could still hold the words under a redaction.
+            withheld.append(page_no)
+        elif wants_layer:
+            page.set_rotation((base + extra) % 360)
             text = edited_text.get(page_no)
             if (text if text is not None else result["text"]).strip():
                 layers[page_no] = _add_text_layer(page, result, text)
+        if page_edits:
+            apply_edits(page, page_edits, base)
+        page.set_rotation((base + extra) % 360)
         for note in notes or []:
             if note["page"] == page_no:
                 _add_note(page, note)
+        if watermark.strip():
+            _add_watermark(page, watermark.strip())
+        if page_numbers:
+            _add_page_number(page, position, len(keep))
     doc.select(keep)
-    if layers or notes:
-        doc.subset_fonts()  # embed only the glyphs used, not whole fonts
-    data = doc.tobytes(garbage=3, deflate=True)
+    if compress:
+        _shrink_images(doc)
+    doc.subset_fonts()  # embed only the glyphs used, not whole fonts
+    options: dict[str, Any] = {"garbage": 4 if compress else 3, "deflate": True}
+    if password:
+        options.update(encryption=fitz.PDF_ENCRYPT_AES_256, user_pw=password, owner_pw=password)
+    data = doc.tobytes(**options)
     doc.close()
-    return data, {"pages": len(keep), "layers": layers}
+    return data, {"pages": len(keep), "layers": layers, "withheld": withheld}
 
 
-def build_text(page_count: int, texts: dict[int, str], removed: Iterable[int] = ()) -> str:
-    """Plain-text export with a heading per page."""
+def pages_as_images(pdf_bytes: bytes, dpi: int = 150) -> bytes:
+    """A zip with one PNG per page of a finished PDF."""
+    out = io.BytesIO()
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc, zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as archive:
+        for i, page in enumerate(doc, start=1):
+            archive.writestr(f"page-{i:02d}.png", page.get_pixmap(dpi=dpi, alpha=False).tobytes("png"))
+    return out.getvalue()
+
+
+def pages_as_pdfs(pdf_bytes: bytes) -> bytes:
+    """A zip with each page of a finished PDF as its own file."""
+    out = io.BytesIO()
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+        for i in range(len(doc)):
+            single = fitz.open()
+            single.insert_pdf(doc, from_page=i, to_page=i)
+            archive.writestr(f"page-{i + 1:02d}.pdf", single.tobytes(garbage=3, deflate=True))
+            single.close()
+    return out.getvalue()
+
+
+def build_text(pages: int | list[int], texts: dict[int, str], removed: Iterable[int] = ()) -> str:
+    """Plain-text export with a heading per page. `pages` is a count or the page order."""
     removed = set(removed)
+    kept = [p for p in (range(pages) if isinstance(pages, int) else pages) if p not in removed]
     parts = [
-        f"--- Page {p + 1} ---\n{texts[p].strip()}"
-        for p in range(page_count)
-        if p in texts and p not in removed and texts[p].strip()
+        f"--- Page {number} ---\n{texts[p].strip()}"
+        for number, p in enumerate(kept, start=1)
+        if p in texts and texts[p].strip()
     ]
     return "\n\n".join(parts) + ("\n" if parts else "")
 

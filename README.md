@@ -11,7 +11,13 @@ A CPU-based, single-service Streamlit proof of concept for scanned PDFs.
 - Words the engine was unsure about are highlighted on the page preview
 - Editable text per page; corrections are kept when you re-read the other pages
 - Searchable PDF export: invisible text placed word by word over the scan, so search hits and selections line up with the image (line by line once a page has been corrected)
-- Page tools with live thumbnails: rotate, remove/restore, stamp a short note (English or Hindi)
+- Page tools with live thumbnails: reorder, rotate, remove/restore, add pages from another PDF, stamp a short note (English or Hindi)
+- Editor: drag a box on the page to add text, highlight, cover an area, redact, or place an image such as a signature
+- Find words on a page to highlight, redact or replace them in place (uses the PDF's own text, or the recognised words of a scan)
+- Redaction deletes the content underneath, including the pixels of a scanned image; redacted pages get no hidden text layer
+- Finishing options: page numbers, watermark, smaller file size, password protection
+- Opens password-protected PDFs when given the password
+- Extra downloads: each page as a PNG or as its own PDF, zipped
 - TXT export
 - Language list shows only the Tesseract language packs actually installed
 - No database, login, payment gateway, external AI API or permanent file storage
@@ -94,7 +100,9 @@ Do not rely on a self-ping process inside the same sleeping service: once the se
 - OCR is not guaranteed to be accurate. Review important content.
 - The searchable text layer is for search and copy. Hindi text is stored without complex-script shaping, and if a correction changes the number of lines on a page, that page's text is searchable but no longer lined up with the scan.
 - "Hindi + English" runs Tesseract as `eng+hin`: with Hindi first, the digit 1 is dropped from Latin text.
-- Page tools are intentionally limited to rotation, page removal and a short stamped note.
+- The editor is not a full layout editor. "Replace text" covers the old words with the surrounding paper colour and writes the new ones in a standard font sized to fit, so it suits short pieces such as a number, date or name, and the result will not match unusual typefaces.
+- After redacting, the recognised text shown under Read and correct (and the .txt download) can still contain the redacted words until you delete them there. The app warns about this.
+- Areas are marked by dragging on the page; the outline appears when you release the mouse, not while dragging.
 - Uploaded documents are processed in memory. Render's filesystem is ephemeral, but do not upload confidential documents to a public demo without an appropriate privacy review.
 - This is a demonstration build, not a production multi-user service. It has no authentication, quotas, malware scanning, job queue or durable storage.
 
